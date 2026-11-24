@@ -131,7 +131,17 @@
         usedCallUrl = true;
         await vapi.reconnect({ id: CALL_ID, webCallUrl: CALL_URL });
       } else {
-        await vapi.start(ASSISTANT_ID);
+        // Kim gaplashganini admin panelda ko'rish uchun Telegram foydalanuvchisini suhbatga biriktiramiz
+        const u = tg?.initDataUnsafe?.user;
+        const overrides = u ? {
+          variableValues: { name: u.first_name || "" },
+          metadata: {
+            tg_id: String(u.id),
+            tg_username: u.username || "",
+            tg_name: [u.first_name, u.last_name].filter(Boolean).join(" "),
+          },
+        } : undefined;
+        await vapi.start(ASSISTANT_ID, overrides);
       }
     } catch (e) {
       idle();
