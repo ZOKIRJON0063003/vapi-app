@@ -71,6 +71,13 @@
   const CALL_ID = q.get("id") || "";
 
   const setStatus = (t) => (status.textContent = t);
+  const errText = (e) => {
+    if (!e) return "noma'lum xato";
+    if (typeof e === "string") return e;
+    const m = e.errorMsg || e.error?.errorMsg || e.error?.msg || e.error?.message || e.message || e.msg;
+    if (typeof m === "string" && m) return m;
+    try { return JSON.stringify(e).slice(0, 300); } catch { return String(e); }
+  };
   const showError = (t) => {
     err.textContent = t;
     if (tg?.openLink) openBtn.style.display = "inline";
@@ -111,8 +118,7 @@
   vapi.on("error", (e) => {
     console.error(e);
     idle();
-    const msg = e?.error?.message || e?.errorMsg || e?.message || "";
-    showError("Xato: " + (typeof msg === "string" ? msg : JSON.stringify(msg)).slice(0, 200));
+    showError("Xato: " + errText(e));
   });
 
   btn.onclick = async () => {
@@ -120,7 +126,7 @@
     if (live) { vapi.stop(); return; }
     btn.disabled = true; label.textContent = "Ulanmoqda…"; setStatus("Mikrofonga ruxsat bering");
     try {
-      if (CALL_URL) {
+      if (CALL_URL && !(PUBLIC_KEY && ASSISTANT_ID)) {
         if (usedCallUrl) throw new Error("Bu suhbat tugagan. Botda yana tugmani bosing.");
         usedCallUrl = true;
         await vapi.reconnect({ id: CALL_ID, webCallUrl: CALL_URL });
@@ -131,7 +137,7 @@
       idle();
       showError(e?.name === "NotAllowedError"
         ? "Mikrofonga ruxsat berilmadi. Telegram sozlamalarida ruxsat bering yoki brauzerda oching."
-        : "Ulanib bo'lmadi: " + (e?.message || e));
+        : "Ulanib bo'lmadi: " + errText(e));
     }
   };
 </script>
