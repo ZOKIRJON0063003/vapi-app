@@ -26,6 +26,14 @@
   h1 { font-size: 20px; margin: 0; font-weight: 600; }
   .logo { width: 150px; height: 150px; border-radius: 50%; }
   #status { color: var(--hint); font-size: 15px; min-height: 1.4em; margin: 0; }
+  .voices { display: flex; gap: 10px; }
+  .voices button {
+    border: 2px solid var(--accent); background: transparent; color: var(--text);
+    padding: 10px 18px; border-radius: 999px; font-size: 15px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .voices button.on { background: var(--accent); color: var(--accent-text); }
+  .voices button:disabled { opacity: .5; }
   .wrap { position: relative; width: 180px; height: 180px; display: grid; place-items: center; }
   #ring {
     position: absolute; inset: 0; border-radius: 50%;
@@ -48,6 +56,10 @@
 <body>
   <img src="logo.png" alt="Sabah AI" class="logo">
   <h1>Sabah AI — ovozli yordamchi</h1>
+  <div class="voices" id="voices">
+    <button data-g="female">👩 Ayol ovozi</button>
+    <button data-g="male">👨 Erkak ovozi</button>
+  </div>
   <div class="wrap">
     <div id="ring"></div>
     <button id="btn" disabled>
@@ -71,6 +83,21 @@
   const ASSISTANT_ID = q.get("a");
   const CALL_URL = q.get("u");   // bot oldindan yaratgan suhbat (Public Key shart emas)
   const CALL_ID = q.get("id") || "";
+  const VOICE_PROVIDER = q.get("vp") || "azure";
+  const VOICES = {
+    female: q.get("vf") || "uz-UZ-MadinaNeural",
+    male: q.get("vm") || "uz-UZ-SardorNeural",
+  };
+  let gender = "female";
+  try { gender = localStorage.getItem("sabah_voice") || "female"; } catch {}
+  const voiceBtns = [...document.querySelectorAll("#voices button")];
+  const paintVoices = () => voiceBtns.forEach((b) => b.classList.toggle("on", b.dataset.g === gender));
+  voiceBtns.forEach((b) => (b.onclick = () => {
+    gender = b.dataset.g; paintVoices();
+    try { localStorage.setItem("sabah_voice", gender); } catch {}
+    tg?.HapticFeedback?.selectionChanged();
+  }));
+  paintVoices();
 
   const setStatus = (t) => (status.textContent = t);
   const errText = (e) => {
@@ -102,6 +129,7 @@
   }
 
   const idle = () => {
+    voiceBtns.forEach((b) => (b.disabled = false));
     live = false; btn.disabled = false; btn.classList.remove("live");
     label.textContent = "Boshlash"; ring.style.transform = "scale(.75)";
   };
@@ -109,6 +137,7 @@
   setStatus("Tugmani bosing va gapiring");
 
   vapi.on("call-start", () => {
+    voiceBtns.forEach((b) => (b.disabled = true));
     live = true; btn.disabled = false; btn.classList.add("live");
     label.textContent = "Tugatish"; setStatus("Ulandi — gapiring");
     tg?.HapticFeedback?.impactOccurred("medium");
@@ -135,14 +164,16 @@
       } else {
         // Kim gaplashganini admin panelda ko'rish uchun Telegram foydalanuvchisini suhbatga biriktiramiz
         const u = tg?.initDataUnsafe?.user;
-        const overrides = u ? {
-          variableValues: { name: u.first_name || "" },
-          metadata: {
+        const overrides = { voice: { provider: VOICE_PROVIDER, voiceId: VOICES[gender] } };
+        if (u) {
+          overrides.variableValues = { name: u.first_name || "" };
+          overrides.metadata = {
             tg_id: String(u.id),
             tg_username: u.username || "",
             tg_name: [u.first_name, u.last_name].filter(Boolean).join(" "),
-          },
-        } : undefined;
+            voice: gender,
+          };
+        }
         await vapi.start(ASSISTANT_ID, overrides);
       }
     } catch (e) {
