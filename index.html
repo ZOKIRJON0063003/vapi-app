@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>AI yordamchi</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="vapi.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #8a8a8a);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --danger: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 28px; padding: 24px 16px; text-align: center;
+  }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  #status { color: var(--hint); font-size: 15px; min-height: 1.4em; margin: 0; }
+  .wrap { position: relative; width: 180px; height: 180px; display: grid; place-items: center; }
+  #ring {
+    position: absolute; inset: 0; border-radius: 50%;
+    background: var(--accent); opacity: .18; transform: scale(.75);
+    transition: transform .08s linear;
+  }
+  #btn {
+    position: relative; width: 132px; height: 132px; border-radius: 50%; border: 0;
+    background: var(--accent); color: var(--accent-text); font-size: 16px; font-weight: 600;
+    cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #btn.live { background: var(--danger); color: #fff; }
+  #btn:disabled { opacity: .6; }
+  #btn svg { width: 40px; height: 40px; }
+  #err { color: var(--danger); font-size: 14px; margin: 0; max-width: 340px; }
+  #open { background: none; border: 0; color: var(--accent); font-size: 14px; text-decoration: underline; cursor: pointer; display: none; }
+</style>
+</head>
+<body>
+  <h1>🎙 AI yordamchi</h1>
+  <div class="wrap">
+    <div id="ring"></div>
+    <button id="btn" disabled>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v5"/></svg>
+      <span id="label">Yuklanmoqda…</span>
+    </button>
+  </div>
+  <p id="status"></p>
+  <p id="err"></p>
+  <button id="open">Brauzerda ochish</button>
+
+<script type="module">
+  const tg = window.Telegram?.WebApp;
+  tg?.ready(); tg?.expand();
+
+  const $ = (id) => document.getElementById(id);
+  const btn = $("btn"), label = $("label"), status = $("status"), err = $("err"), ring = $("ring"), openBtn = $("open");
+
+  const q = new URLSearchParams(location.search);
+  const PUBLIC_KEY = q.get("k");
+  const ASSISTANT_ID = q.get("a");
+
+  const setStatus = (t) => (status.textContent = t);
+  const showError = (t) => {
+    err.textContent = t;
+    if (tg?.openLink) openBtn.style.display = "inline";
+  };
+  openBtn.onclick = () => tg?.openLink(location.href);
+
+  if (!PUBLIC_KEY || !ASSISTANT_ID) {
+    label.textContent = "Xato";
+    showError("Sozlama yetishmayapti: botdagi tugma orqali oching.");
+    throw new Error("missing params");
+  }
+
+  let vapi, live = false;
+  try {
+    vapi = new window.Vapi(PUBLIC_KEY);
+  } catch (e) {
+    label.textContent = "Xato";
+    showError("Vapi yuklanmadi (vapi.js fayli joylanganini tekshiring).");
+    throw e;
+  }
+
+  const idle = () => {
+    live = false; btn.disabled = false; btn.classList.remove("live");
+    label.textContent = "Boshlash"; ring.style.transform = "scale(.75)";
+  };
+  idle();
+  setStatus("Tugmani bosing va gapiring");
+
+  vapi.on("call-start", () => {
+    live = true; btn.disabled = false; btn.classList.add("live");
+    label.textContent = "Tugatish"; setStatus("Ulandi — gapiring");
+    tg?.HapticFeedback?.impactOccurred("medium");
+  });
+  vapi.on("call-end", () => { idle(); setStatus("Suhbat tugadi"); });
+  vapi.on("speech-start", () => setStatus("AI gapiryapti…"));
+  vapi.on("speech-end", () => setStatus("Sizni tinglayapti…"));
+  vapi.on("volume-level", (v) => (ring.style.transform = `scale(${0.75 + Math.min(v, 1) * 0.5})`));
+  vapi.on("error", (e) => {
+    console.error(e);
+    idle();
+    const msg = e?.error?.message || e?.errorMsg || e?.message || "";
+    showError("Xato: " + (typeof msg === "string" ? msg : JSON.stringify(msg)).slice(0, 200));
+  });
+
+  btn.onclick = async () => {
+    err.textContent = "";
+    if (live) { vapi.stop(); return; }
+    btn.disabled = true; label.textContent = "Ulanmoqda…"; setStatus("Mikrofonga ruxsat bering");
+    try {
+      await vapi.start(ASSISTANT_ID);
+    } catch (e) {
+      idle();
+      showError(e?.name === "NotAllowedError"
+        ? "Mikrofonga ruxsat berilmadi. Telegram sozlamalarida ruxsat bering yoki brauzerda oching."
+        : "Ulanib bo'lmadi: " + (e?.message || e));
+    }
+  };
+</script>
+</body>
+</html>
