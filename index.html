@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>AI yordamchi</title>
+<title>Sabah AI</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="vapi.js"></script>
 <style>
@@ -21,9 +21,10 @@
     background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 28px; padding: 24px 16px; text-align: center;
+    gap: 20px; padding: 24px 16px; text-align: center;
   }
   h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  .logo { width: 150px; height: 150px; border-radius: 50%; }
   #status { color: var(--hint); font-size: 15px; min-height: 1.4em; margin: 0; }
   .wrap { position: relative; width: 180px; height: 180px; display: grid; place-items: center; }
   #ring {
@@ -45,7 +46,8 @@
 </style>
 </head>
 <body>
-  <h1>🎙 AI yordamchi</h1>
+  <img src="logo.png" alt="Sabah AI" class="logo">
+  <h1>Sabah AI — ovozli yordamchi</h1>
   <div class="wrap">
     <div id="ring"></div>
     <button id="btn" disabled>
