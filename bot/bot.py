@@ -328,6 +328,8 @@ def build_start_kb():
     return link, InlineKeyboardMarkup([
         [InlineKeyboardButton("🎙 AI bilan gaplashish", web_app=WebAppInfo(url=link))],
         [InlineKeyboardButton("🌐 Brauzerda ochish", url=link)],
+        [InlineKeyboardButton("📚 Katalog", url="https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj"),
+         InlineKeyboardButton("🔥 Aksiya", url="https://t.me/SUPER7677")],
     ])
 
 
@@ -522,15 +524,52 @@ def vapi_system_prompt():
 
 
 SABAH_PERSONA = (
-    "Sen «Sabah AI» — Sabah brendining (ko'rpa-to'shak, choyshab, satin/super satin to'plamlar) rasmiy savdo yordamchisisan.\n"
+    "Sen «Sabah AI» — Sabaev Home (Sabah) do'konining rasmiy savdo yordamchisisan. Do'kon uy tekstili uchun "
+    "MATOLAR sotadi: ranfors, satin, super satin, pike, muleton va boshqalar — rulon yoki metr hisobida, ulgurji ham.\n"
     "QOIDALAR:\n"
-    "1. Faqat Sabah mahsulotlarini taklif qil va maqta. Mijozni Sabah'dan xarid qilishga undab tur.\n"
-    "2. HECH QACHON boshqa do'kon, bozor, marketplace (OLX, Wildberries, Uzum, Ozon va h.k.) yoki raqobatchi brendni tavsiya qilma.\n"
-    "3. «Qayerdan olsam bo'ladi?», «buyurtma», «narx», «manzil» kabi savollarda Sabah kanallari va aloqa ma'lumotlarini ber.\n"
-    "4. Bilmagan narsangni (narx, mavjudlik, o'lcham) o'ylab topma — «aniqlab, operatorimiz siz bilan bog'lanadi» de "
-    "va mijozdan ism va telefon raqamini so'ra.\n"
-    "5. Suhbatni har doim xaridga yo'naltir: o'lcham (1.5 kishilik, 2 kishilik, evro), rang, kim uchun ekanini so'ra."
+    "1. Faqat Sabaev Home mahsulotlarini taklif qil. Mijozni xaridga undab tur.\n"
+    "2. HECH QACHON boshqa do'kon, bozor, marketplace (OLX, Wildberries, Uzum, Ozon va h.k.) yoki raqobatchini tavsiya qilma.\n"
+    "3. Mahsulot haqida so'rashsa — quyidagi ro'yxatdan mos matoni va uning Telegram havolasini ber "
+    "(havolani to'liq yoz, masalan https://t.me/Pastel9006/20846).\n"
+    "4. «Qayerdan olsam bo'ladi?», «buyurtma», «manzil» savollarida: katalog sahifasi, kanal, admin va telefon raqamini ber.\n"
+    "5. Narxni bilmaysan — o'ylab topma: «narx va mavjudlik uchun adminga yozing» deb, mos admin kontaktini ber.\n"
+    "6. Buyurtma uchun mijozdan mato turi, rang/kod (masalan SS-103) va miqdorini (rulon yoki metr) so'ra."
 )
+
+DEFAULT_INFO = """KATALOG (hamma mahsulot bir sahifada): https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj
+Ish vaqti: 06:00–18:00. Yetkazib berish bor. Do'kondan olib ketish ham mumkin.
+
+TURKIYA MAHSULOTLARI — manzil: Abu Saxiy, Uyg'ur bozori, E-8. Kanal: https://t.me/Sabaevhomeuz
+Admin: @sabaev_admin, +998 90 099 09 44 · Nurullo: @Nurulloh_571, +998 99 740 00 62
+- Ranfors (100% paxta, eni 2.40 m, choyshab uchun): https://t.me/Sabaevhomeuz/10550
+  Ranfors print https://t.me/Sabaevhomeuz/10289 · Ranfors adnatoni https://t.me/Sabaevhomeuz/10052
+  Ranfors 5D https://t.me/Sabaevhomeuz/9925 · Ranfors 4D https://t.me/Sabaevhomeuz/9974
+  Ranfors jakkard https://t.me/Sabaevhomeuz/10029 · Ranfors gofra https://t.me/Sabaevhomeuz/9651
+- Satin: Strayp https://t.me/Sabaevhomeuz/10085 · Jakkard https://t.me/Sabaevhomeuz/10020 ·
+  Digital https://t.me/Sabaevhomeuz/10007 · Adnatoni https://t.me/Sabaevhomeuz/9137
+- Pike va boshqalar: Wafli pike https://t.me/Sabaevhomeuz/10185 · Mayda pike https://t.me/Sabaevhomeuz/10193 ·
+  Zanjir pike https://t.me/Sabaevhomeuz/10203 · Digital vafli pike https://t.me/Sabaevhomeuz/9847 ·
+  Turkiya vafel https://t.me/Sabaevhomeuz/9817 · Duck https://t.me/Sabaevhomeuz/9604 ·
+  Digital duck https://t.me/Sabaevhomeuz/9531 · Laviva print https://t.me/Sabaevhomeuz/10114
+- Muleton (suv o'tkazmas): https://t.me/Sabaevhomeuz/10750
+
+XITOY MAHSULOTLARI — manzil: Abu Saxiy, Uyg'ur bozori, E-76-77. Kanal: https://t.me/Pastel9006
+Komilbek: @komil_1247, +998 90 021 12 47 · Ziyodillo: @Ziyodillo70, +998 99 302 97 70
+Ulgurji: 1 rulondan, alohida narx.
+- Super satin (ikki tomoni bor, eni 2.40 m, 100% paxta, kodlar SS-…):
+  Bolalar (SS-274–314) https://t.me/Pastel9006/20846 · Bir rangli (SS-267–273) https://t.me/Pastel9006/20832 ·
+  Kattalar (SS-210–266) https://t.me/Pastel9006/20775 · SS kodlar https://t.me/Pastel9006/20701 ·
+  Boshqa ranglar https://t.me/Pastel9006/20482
+- Yevro satin (oq yevro satin eni 2.60 m): Oq https://t.me/Pastel9006/19981 · Bir rangli https://t.me/Pastel9006/19025 ·
+  Jakkard satin https://t.me/Pastel9006/19369 · Oq jakkard https://t.me/Pastel9006/19418 · Baykovi satin https://t.me/Pastel9006/19979
+- 5D digital https://t.me/Pastel9006/20334 · Strayp satin mehmonxona https://t.me/Pastel9006/20401 ·
+  Tencel https://t.me/Pastel9006/20470 · Muleton https://t.me/Pastel9006/20729
+
+AKSIYA va chegirmalar kanali: https://t.me/SUPER7677
+Instagram: https://www.instagram.com/sabaevhome.uz
+
+Qanday buyurtma beriladi: 1) mato turini tanlab havola orqali ko'ring; 2) rang, kod va miqdorni (rulon yoki metr) yozing;
+3) narx va yetkazib berish bo'yicha kelishamiz; 4) bozordagi do'kondan olib keting yoki yetkazib berishni tanlang."""
 
 
 def get_setting(key, default=""):
@@ -540,7 +579,7 @@ def get_setting(key, default=""):
 
 def chat_system(u):
     parts = [SABAH_PERSONA]
-    info = get_setting("info")
+    info = get_setting("info") or DEFAULT_INFO
     if info:
         parts.append("SABAH HAQIDA MA'LUMOT (kanallar, aloqa, mahsulotlar — shularga tayan):\n" + info)
     faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
@@ -563,7 +602,7 @@ async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     arg = update.message.text.partition(" ")[2].strip()
     if not arg:
-        cur = get_setting("info") or "(hali yozilmagan)"
+        cur = get_setting("info") or ("(standart: Sabaev Home katalogi)\n\n" + DEFAULT_INFO[:1500] + "…")
         await update.message.reply_text(
             f"📝 AI biladigan Sabah ma'lumotlari:\n\n{cur}\n\n"
             "O'zgartirish uchun /info dan keyin hammasini qaytadan yozing, masalan:\n\n"
