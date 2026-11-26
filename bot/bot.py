@@ -533,7 +533,11 @@ SABAH_PERSONA = (
     "(havolani to'liq yoz, masalan https://t.me/Pastel9006/20846).\n"
     "4. «Qayerdan olsam bo'ladi?», «buyurtma», «manzil» savollarida: katalog sahifasi, kanal, admin va telefon raqamini ber.\n"
     "5. Narxni bilmaysan — o'ylab topma: «narx va mavjudlik uchun adminga yozing» deb, mos admin kontaktini ber.\n"
-    "6. Buyurtma uchun mijozdan mato turi, rang/kod (masalan SS-103) va miqdorini (rulon yoki metr) so'ra."
+    "6. Buyurtma uchun mijozdan mato turi, rang/kod (masalan SS-103) va miqdorini (rulon yoki metr) so'ra.\n"
+    "7. Mijozlar sheva va ruscha so'zlar ishlatadi: «silka», «ssilka», «ссылка», «link» = HAVOLA. "
+    "Havola so'rashsa — katalog havolasini va mos kanal/post havolasini ber. «adres» = manzil, «nomer» = telefon, "
+    "«skidka»/«aksiya» = chegirma (aksiya kanalini ber), «optom» = ulgurji, «metrlik» = metr hisobida.\n"
+    "8. Agar so'z tushunarsiz bo'lsa, o'ylab topma — mijozdan aniqlashtirib so'ra."
 )
 
 DEFAULT_INFO = """KATALOG (hamma mahsulot bir sahifada): https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj
@@ -653,6 +657,7 @@ def norm(t):
 
 
 GREET_RE = re.compile(r"^\W*(salom|assalom\w*|asalom\w*|salomaleykum|hayrli|привет|здравствуйте|hello|hi)(\s+\w+)?\W*$", re.I)
+LINK_RE = re.compile(r"\b(s+ilka\w*|s+ilk[ai]|ссылк\w*|link\w*|havola\w*|katalog\w*|каталог\w*|kanal\w*)\b", re.I)
 THANKS_RE = re.compile(r"^\W*(rahmat|raxmat|tashakkur|спасибо|thanks?|thank you)\W*\w*\W*$", re.I)
 
 
@@ -661,6 +666,12 @@ def builtin_answer(text, u):
     if GREET_RE.match(text):
         return (f"Va alaykum assalom, {u.first_name or 'hurmatli mijoz'}! 😊 Men Sabah AI.\n"
                 "Savolingizni yozing yoki 🎙 tugmasini bosib men bilan ovozli gaplashing.")
+    if LINK_RE.search(text):
+        return ("📚 Katalog (hamma matolar): https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj\n"
+                "🇹🇷 Turkiya matolari: https://t.me/Sabaevhomeuz\n"
+                "🇨🇳 Xitoy matolari (super satin): https://t.me/Pastel9006\n"
+                "🔥 Aksiya: https://t.me/SUPER7677\n"
+                "📞 Admin: @sabaev_admin, +998 90 099 09 44")
     if THANKS_RE.match(text):
         return "Arzimaydi! 😊 Yana savol bo'lsa, bemalol yozing."
     return None
