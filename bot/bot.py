@@ -233,6 +233,8 @@ db.execute("CREATE TABLE IF NOT EXISTS seen_calls(id TEXT PRIMARY KEY)")
 db.execute("CREATE TABLE IF NOT EXISTS chats(user_id INTEGER PRIMARY KEY, chat_id TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS faq(id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, answer TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS op_group(admin_chat INTEGER, msg_id INTEGER, group_chat INTEGER, "
+           "group_msg INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY COLLATE NOCASE, phone TEXT)")
 db.execute("""CREATE TABLE IF NOT EXISTS messages(
@@ -716,16 +718,27 @@ async def openai_reply(u):
     return ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
 
 
+def remember_origin(update, admin_chat, admin_msg):
+    """Admin Reply qilganda javob qayerga borishini eslab qoladi: shaxsiy chat yoki guruh."""
+    if update.effective_chat.type == "private":
+        db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (admin_chat, admin_msg, update.effective_user.id))
+    else:
+        db.execute("INSERT OR REPLACE INTO op_group VALUES(?,?,?,?)",
+                   (admin_chat, admin_msg, update.effective_chat.id, update.message.message_id))
+    db.commit()
+
+
 async def to_operator(update, context, text):
     u = update.effective_user
     await update.message.reply_text("Savolingiz operatorimizga yuborildi, tez orada javob beramiz 🙏")
     for aid in ADMIN_IDS:
         try:
             m = await context.bot.send_message(
-                aid, f"❓ <b>Savol</b> — {who(u.id, u.username, u.full_name)}\n\n{html.escape(text)}\n\n"
+                aid, f"❓ <b>Savol</b> — {who(u.id, u.username, u.full_name)}"
+                     + (f" · 👥 {html.escape(update.effective_chat.title or 'guruh')}" if update.effective_chat.type != "private" else "")
+                     + f"\n\n{html.escape(text)}\n\n"
                      "<i>Javob berish uchun shu xabarga «Reply» qilib yozing.</i>", parse_mode="HTML")
-            db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (aid, m.message_id, u.id))
-            db.commit()
+            remember_origin(update, aid, m.message_id)
         except Exception as e:
             log.warning("Operatorga yuborilmadi: %s", e)
 
@@ -735,6 +748,16 @@ async def admin_reply(update, context):
     rt = update.message.reply_to_message
     if not rt:
         return False
+    grp = db.execute("SELECT group_chat, group_msg FROM op_group WHERE admin_chat=? AND msg_id=?",
+                     (update.effective_chat.id, rt.message_id)).fetchone()
+    if grp:
+        try:
+            await context.bot.send_message(grp[0], f"👩‍💼 Sabah operatori:\n{update.message.text}",
+                                           reply_to_message_id=grp[1])
+            await update.message.reply_text("✅ Javob guruhga yuborildi.")
+        except Exception as e:
+            await update.message.reply_text(f"Yuborilmadi: {e}")
+        return True
     row = db.execute("SELECT user_id FROM op_msgs WHERE admin_chat=? AND msg_id=?",
                      (update.effective_chat.id, rt.message_id)).fetchone()
     if not row:
@@ -1115,8 +1138,7 @@ async def photo_to_operator(update, context, note):
             cap = (f"🖼 Rasm — {u.full_name} (@{u.username or '-'}, {u.id})\n{note}\n\n"
                    "Javob berish uchun shu xabarga «Reply» qiling.")
             m = await msg.copy(aid, caption=cap[:1000])
-            db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (aid, m.message_id, u.id))
-            db.commit()
+            remember_origin(update, aid, m.message_id)
         except Exception as e:
             log.warning("Rasm operatorga yuborilmadi: %s", e)
 
@@ -1208,6 +1230,92 @@ async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📋 Oxirgi yozuvlar:\n\n" + txt[-3800:])
 
 
+async def ai_answer(u):
+    """Gemini → OpenAI → Claude: birinchi ishlagan AI javobi (yoki bo'sh)."""
+    if GEMINI_KEY:
+        try:
+            a = await gemini_reply(u)
+            if a:
+                return a
+        except Exception as e:
+            log.error("Gemini xatosi: %s", e)
+    if OPENAI_KEY:
+        try:
+            a = await openai_reply(u)
+            if a:
+                return a
+        except Exception as e:
+            log.error("OpenAI xatosi: %s", str(e)[:300])
+    if claude:
+        try:
+            a = await claude_reply(u)
+            if a:
+                return a
+        except Exception as e:
+            log.error("Claude xatosi: %s", str(e)[:300])
+    return ""
+
+
+# ---------------------------------------------------------------- GURUH
+# Guruhda bot hamma xabarga javob bermaydi — faqat savol, mahsulot so'rovi, @mention yoki botga Reply bo'lsa.
+ASK_RE = re.compile(r"\b(bormi|bor\s*mi|narx\w*|qancha|nech\w*\s*pul|nechpul|silka|ssilka|ссылк\w*|manzil\w*|adres\w*|"
+                    r"yetkaz\w*|dostavka|optom|ulgurji|сколько|цена|есть\s+ли|qayerda|qayerdan|sotasiz\w*|olsa\s*bo\w*)\b", re.I)
+PRODUCT_RE = re.compile(r"\b(satin|ranfors|pike|muleton|mato\w*|choyshab\w*|rulon|metr\w*|ss-?\d+|kod|yevro|evro|"
+                        r"jakkard|tencel|duck|ткан\w*|сатин)\b", re.I)
+
+
+def group_should_answer(text, mentioned, replied):
+    if mentioned or replied:
+        return True
+    return bool(ASK_RE.search(text) or (PRODUCT_RE.search(text) and "?" in text))
+
+
+def _group_ctx(update, context):
+    msg = update.message
+    me = (context.bot.username or "").lower()
+    txt = (msg.text or msg.caption or "")
+    mentioned = bool(me) and f"@{me}" in txt.lower()
+    rt = msg.reply_to_message
+    replied = bool(rt and rt.from_user and rt.from_user.id == context.bot.id)
+    clean = re.sub(rf"@{re.escape(me)}", "", txt, flags=re.I).strip() if me else txt.strip()
+    return mentioned, replied, clean
+
+
+async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u, msg = update.effective_user, update.message
+    if not u or u.is_bot:
+        return
+    mentioned, replied, text = _group_ctx(update, context)
+    if u.id in ADMIN_IDS and not mentioned:
+        return  # adminning guruhdagi o'z yozishmalariga aralashmaymiz
+    if not text or not group_should_answer(text, mentioned, replied):
+        return
+    track(u)
+    save_msg(u.id, "user", text)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    answer = faq_match(text) or (builtin_answer(text, u) if (mentioned or replied or LINK_RE.search(text)) else None)
+    if not answer:
+        answer = await ai_answer(u)
+    if not answer:
+        if mentioned or replied:
+            await to_operator(update, context, text)
+        return
+    save_msg(u.id, "ai", answer)
+    await msg.reply_text(answer[:4000], disable_web_page_preview=True)
+
+
+async def group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u or u.is_bot:
+        return
+    mentioned, replied, text = _group_ctx(update, context)
+    if u.id in ADMIN_IDS and not mentioned:
+        return
+    if not (mentioned or replied or ASK_RE.search(text) or PRODUCT_RE.search(text)):
+        return  # izohsiz rasmlarga guruhda javob bermaymiz
+    await photo_msg(update, context)
+
+
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     text = (update.message.text or "").strip()
@@ -1230,24 +1338,8 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     # 1) Tayyor javob (FAQ) — bepul va aniq
     answer = faq_match(text) or builtin_answer(text, u)
-    # 2) Gemini (bepul AI)
-    if not answer and GEMINI_KEY:
-        try:
-            answer = await gemini_reply(u)
-        except Exception as e:
-            log.error("Gemini xatosi: %s", e)
-    # 3) OpenAI (agar kalit bo'lsa)
-    if not answer and OPENAI_KEY:
-        try:
-            answer = await openai_reply(u)
-        except Exception as e:
-            log.error("OpenAI xatosi: %s", str(e)[:300])
-    # 4) Claude (agar kalit bo'lsa)
-    if not answer and claude:
-        try:
-            answer = await claude_reply(u)
-        except Exception as e:
-            log.error("Claude xatosi: %s", str(e)[:300])
+    if not answer:
+        answer = await ai_answer(u)
     # 4) Hech biri javob bermasa — operatorga
     if not answer:
         await to_operator(update, context, text)
@@ -1569,6 +1661,8 @@ def main():
     app.add_handler(CallbackQueryHandler(dial_cb, pattern="^(no)?dial:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_msg))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE, photo_msg))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, group_text))
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.GROUPS, group_photo))
     app.add_handler(CommandHandler("reindex", reindex_cmd))
     app.add_handler(CallbackQueryHandler(talk, pattern="^talk$"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm:"))
