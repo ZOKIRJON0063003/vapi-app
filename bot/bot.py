@@ -180,7 +180,13 @@ if ANTHROPIC_KEY:
     except ImportError:
         print("⚠️  'anthropic' kutubxonasi o'rnatilmagan:  pip install anthropic")
 else:
-    print("ℹ️  ANTHROPIC_API_KEY yo'q — yozma javoblar Vapi chat orqali (karta talab qiladi).")
+    pass  # Claude ixtiyoriy
+
+# 9) Google Gemini — bepul AI (karta talab qilmaydi)
+GEMINI_KEY = (env.get("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (env.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+print("✅ Gemini (bepul) yozma savollarga javob beradi" if GEMINI_KEY else
+      "ℹ️  Gemini kaliti yo'q — Telegram'da adminga: /kalit AIza...")
 
 # .env ni toza holatda qayta yozamiz
 with open(ENV_FILE, "w") as f:
@@ -189,7 +195,17 @@ with open(ENV_FILE, "w") as f:
             f"VOICE_PROVIDER={VOICE_PROVIDER}\nVOICE_FEMALE={VOICE_FEMALE}\nVOICE_MALE={VOICE_MALE}\n"
             + (f"VAPI_PHONE_NUMBER_ID={PHONE_ID}\n" if PHONE_ID else "")
             + (f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}\n" if ANTHROPIC_KEY else "")
-            + (f"CLAUDE_MODEL={CLAUDE_MODEL}\n" if env.get("CLAUDE_MODEL") else ""))
+            + (f"CLAUDE_MODEL={CLAUDE_MODEL}\n" if env.get("CLAUDE_MODEL") else "")
+            + (f"GEMINI_API_KEY={GEMINI_KEY}\n" if GEMINI_KEY else "")
+            + (f"GEMINI_MODEL={GEMINI_MODEL}\n" if env.get("GEMINI_MODEL") else ""))
+
+
+def set_env(key, value):
+    """.env dagi bitta qiymatni almashtiradi yoki qo'shadi."""
+    txt = open(ENV_FILE).read()
+    line = f"{key}={value}"
+    txt = re.sub(rf"(?m)^{key}=.*$", line, txt) if re.search(rf"(?m)^{key}=", txt) else txt.rstrip("\n") + "\n" + line + "\n"
+    open(ENV_FILE, "w").write(txt)
 os.chmod(ENV_FILE, 0o600)
 
 # ---------------------------------------------------------------- ma'lumotlar bazasi
@@ -205,6 +221,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS users(
     first_seen TEXT, last_seen TEXT, starts INTEGER DEFAULT 0)""")
 db.execute("CREATE TABLE IF NOT EXISTS seen_calls(id TEXT PRIMARY KEY)")
 db.execute("CREATE TABLE IF NOT EXISTS chats(user_id INTEGER PRIMARY KEY, chat_id TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS faq(id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, answer TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY COLLATE NOCASE, phone TEXT)")
 db.execute("""CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, text TEXT, ts TEXT)""")
@@ -527,10 +545,142 @@ async def claude_reply(u):
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
+# ---------------------------------------------------------------- FAQ, Gemini, operator
+def norm(t):
+    return re.sub(r"['`ʻ’‘]", "", (t or "").lower())
+
+
+def faq_match(text):
+    t, best, score = norm(text), None, 0
+    for kw, ans in db.execute("SELECT keywords, answer FROM faq"):
+        hits = sum(1 for k in kw.split(",") if norm(k).strip() and norm(k).strip() in t)
+        if hits > score:
+            best, score = ans, hits
+    return best
+
+
+async def gemini_reply(u):
+    system = vapi_system_prompt()
+    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
+    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
+    faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
+    if faq:
+        system += "\n\nSabah haqida aniq ma'lumotlar (shularga tayan):\n" + faq
+    contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                for m in claude_history(u.id)] or [{"role": "user", "parts": [{"text": "Salom"}]}]
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+            headers={"x-goog-api-key": GEMINI_KEY},
+            json={"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
+                  "generationConfig": {"maxOutputTokens": 800}},
+        )
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini {r.status_code}: {r.text[:300]}")
+    cands = r.json().get("candidates") or []
+    parts = ((cands[0].get("content") or {}).get("parts") or []) if cands else []
+    return "".join(p.get("text", "") for p in parts).strip()
+
+
+async def to_operator(update, context, text):
+    u = update.effective_user
+    await update.message.reply_text("Savolingiz operatorimizga yuborildi, tez orada javob beramiz 🙏")
+    for aid in ADMIN_IDS:
+        try:
+            m = await context.bot.send_message(
+                aid, f"❓ <b>Savol</b> — {who(u.id, u.username, u.full_name)}\n\n{html.escape(text)}\n\n"
+                     "<i>Javob berish uchun shu xabarga «Reply» qilib yozing.</i>", parse_mode="HTML")
+            db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (aid, m.message_id, u.id))
+            db.commit()
+        except Exception as e:
+            log.warning("Operatorga yuborilmadi: %s", e)
+
+
+async def admin_reply(update, context):
+    """Admin savol xabariga Reply qilsa — javob mijozga boradi. True qaytarsa, xabar shu yerda tugadi."""
+    rt = update.message.reply_to_message
+    if not rt:
+        return False
+    row = db.execute("SELECT user_id FROM op_msgs WHERE admin_chat=? AND msg_id=?",
+                     (update.effective_chat.id, rt.message_id)).fetchone()
+    if not row:
+        return False
+    try:
+        await context.bot.send_message(row[0], f"👩‍💼 Sabah operatori:\n{update.message.text}")
+        save_msg(row[0], "ai", update.message.text)
+        await update.message.reply_text("✅ Javob mijozga yuborildi.")
+    except Exception as e:
+        await update.message.reply_text(f"Yuborilmadi: {e}")
+    return True
+
+
+async def faq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    arg = update.message.text.partition(" ")[2].strip()
+    m = re.match(r"(?i)^o['`ʻ’]?chir\s+(\d+)$", arg)
+    if m:
+        db.execute("DELETE FROM faq WHERE id=?", (int(m.group(1)),))
+        db.commit()
+        await update.message.reply_text(f"🗑 {m.group(1)}-javob o'chirildi.")
+        return
+    if "=" in arg:
+        kw, _, ans = arg.partition("=")
+        kw = ",".join(k.strip().lower() for k in kw.split(",") if k.strip())
+        if not kw or not ans.strip():
+            await update.message.reply_text("Format: /faq narx, qancha = Javob matni")
+            return
+        db.execute("INSERT INTO faq(keywords, answer) VALUES(?,?)", (kw, ans.strip()))
+        db.commit()
+        await update.message.reply_text(f"✅ Saqlandi. Kalit so'zlar: {kw}")
+        return
+    rows = db.execute("SELECT id, keywords, answer FROM faq ORDER BY id").fetchall()
+    lst = "\n\n".join(f"{i}. 🔑 {k}\n💬 {a[:150]}" for i, k, a in rows) or "Hali tayyor javob yo'q."
+    await update.message.reply_text(
+        f"📚 Tayyor javoblar:\n\n{lst}\n\n"
+        "Qo'shish:\n/faq narx, qancha, нарх = 2 kishilik to'plam 450 000 so'm\n"
+        "O'chirish:\n/faq o'chir 2")
+
+
+async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kalit AIza...  (Gemini)  yoki  /kalit sk-ant-...  (Claude) — kalit .env ga yoziladi."""
+    global GEMINI_KEY, claude, anthropic
+    if not is_admin(update):
+        return
+    k = update.message.text.partition(" ")[2].strip()
+    try:
+        await update.message.delete()  # kalit chatda qolmasin
+    except Exception:
+        pass
+    chat = update.effective_chat.id
+    if k.startswith("AIza"):
+        GEMINI_KEY = k
+        set_env("GEMINI_API_KEY", k)
+        try:
+            test = await gemini_reply(update.effective_user)
+            await context.bot.send_message(chat, f"✅ Gemini ulandi va ishlayapti.\nSinov javobi: {test[:200]}")
+        except Exception as e:
+            await context.bot.send_message(chat, f"⚠️ Kalit saqlandi, lekin Gemini xato berdi:\n{str(e)[:300]}")
+    elif k.startswith("sk-ant-"):
+        try:
+            import anthropic as _a
+            anthropic = _a
+            claude = _a.AsyncAnthropic(api_key=k)
+            set_env("ANTHROPIC_API_KEY", k)
+            await context.bot.send_message(chat, "✅ Claude kaliti saqlandi.")
+        except ImportError:
+            await context.bot.send_message(chat, "Avval terminalda: pip install anthropic")
+    else:
+        await context.bot.send_message(chat, "Kalit tanilmadi. Gemini kaliti «AIza…», Claude kaliti «sk-ant-…» bilan boshlanadi.\n"
+                                             "Gemini kalitini bepul olish: aistudio.google.com → Get API key")
+
+
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     text = (update.message.text or "").strip()
     if not text:
+        return
+    if u.id in ADMIN_IDS and await admin_reply(update, context):
         return
     if u.id in ADMIN_IDS and CALL_WORDS.search(text):
         phone, raw = find_phone(text)
@@ -545,52 +695,24 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admins(context, f"🆕 Yangi foydalanuvchi #{total}\n{who(u.id, u.username, u.full_name)}")
     save_msg(u.id, "user", text)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    if claude:
-        sorry = "Kechirasiz, hozir javob bera olmayapman. Birozdan keyin yozing 🙏"
+    # 1) Tayyor javob (FAQ) — bepul va aniq
+    answer = faq_match(text)
+    # 2) Gemini (bepul AI)
+    if not answer and GEMINI_KEY:
         try:
-            answer = await claude_reply(u) or "Kechirasiz, tushunmadim. Boshqacha yozib ko'ring."
-        except anthropic.AuthenticationError:
-            log.error("Claude: ANTHROPIC_API_KEY noto'g'ri yoki o'chirilgan")
-            answer = sorry
-        except anthropic.RateLimitError:
-            log.error("Claude: limit oshdi, keyinroq urinib ko'ring")
-            answer = "Hozir juda ko'p so'rov bor, bir daqiqadan keyin yozing 🙏"
-        except anthropic.APIStatusError as e:
-            log.error("Claude xatosi %s: %s", e.status_code, str(e.message)[:400])
-            answer = sorry
-        except anthropic.APIConnectionError as e:
-            log.error("Claude bilan aloqa xatosi: %s", e)
-            answer = sorry
-        else:
-            save_msg(u.id, "ai", answer)
-        for i in range(0, len(answer), 4000):
-            await update.message.reply_text(answer[i:i + 4000])
+            answer = await gemini_reply(u)
+        except Exception as e:
+            log.error("Gemini xatosi: %s", e)
+    # 3) Claude (agar kalit bo'lsa)
+    if not answer and claude:
+        try:
+            answer = await claude_reply(u)
+        except Exception as e:
+            log.error("Claude xatosi: %s", str(e)[:300])
+    # 4) Hech biri javob bermasa — operatorga
+    if not answer:
+        await to_operator(update, context, text)
         return
-    row = db.execute("SELECT chat_id FROM chats WHERE user_id=?", (u.id,)).fetchone()
-    body = {"assistantId": ASSISTANT_ID, "input": text,
-            "assistantOverrides": {"variableValues": {"name": u.first_name or ""},
-                                   "metadata": {"tg_id": str(u.id), "tg_username": u.username or ""}}}
-    if row:
-        body["previousChatId"] = row[0]
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{VAPI}/chat", headers=PRIV_H, json=body)
-            if r.status_code >= 400 and row:  # eski suhbat topilmasa, yangisini boshlaymiz
-                body.pop("previousChatId")
-                r = await client.post(f"{VAPI}/chat", headers=PRIV_H, json=body)
-    except httpx.HTTPError as e:
-        log.error("Vapi chat aloqa xatosi: %s", e)
-        await update.message.reply_text("Kechirasiz, hozir javob bera olmayapman. Birozdan keyin yozing 🙏")
-        return
-    if r.status_code >= 400:
-        log.error("Vapi chat xatosi %s: %s", r.status_code, r.text[:500])
-        await update.message.reply_text("Kechirasiz, hozir javob bera olmayapman. Birozdan keyin yozing 🙏")
-        return
-    data = r.json()
-    answer = chat_output(data) or "Kechirasiz, tushunmadim. Boshqacha yozib ko'ring."
-    if data.get("id"):
-        db.execute("INSERT OR REPLACE INTO chats VALUES(?,?)", (u.id, data["id"]))
-        db.commit()
     save_msg(u.id, "ai", answer)
     for i in range(0, len(answer), 4000):
         await update.message.reply_text(answer[i:i + 4000])
@@ -622,6 +744,8 @@ def home_text():
             f"🤖 Assistant: {html.escape(ASSISTANT.get('name') or ASSISTANT_ID)}\n\n"
             "Buyruqlar:\n/users — foydalanuvchilar\n/calls — ovozli suhbatlar\n/msgs — yozma xabarlar\n/stats — statistika\n"
             "/assistant — assistantni tanlash\n"
+            "/faq — tayyor javoblar (narx, manzil…)\n"
+            "/kalit AIza… — bepul Gemini AI ni ulash\n"
             "/send matn — hammaga xabar ({{name}} = mijoz ismi)\n\n"
             "📞 <b>Telefon qo'ng'iroq</b>" + (f" ({html.escape(PHONE_LABEL)})" if PHONE_ID else " — <i>o'chiq, raqam ulanmagan</i>") + "\n"
             "«Aliga ter» yoki «+998901234567 ga qo'ng'iroq qil, buyurtmani tasdiqlasin»\n"
@@ -891,6 +1015,8 @@ def main():
     app.add_handler(CommandHandler("send", send_cmd))
     app.add_handler(CommandHandler("msgs", msgs_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("faq", faq_cmd))
+    app.add_handler(CommandHandler(["kalit", "key"], key_cmd))
     app.add_handler(CommandHandler("call", call_cmd))
     app.add_handler(CommandHandler("assistant", assistant_cmd))
     app.add_handler(CallbackQueryHandler(assistant_cb, pattern="^asst:"))
