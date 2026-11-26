@@ -235,11 +235,11 @@ db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT
 db.execute("CREATE TABLE IF NOT EXISTS faq(id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, answer TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS op_group(admin_chat INTEGER, msg_id INTEGER, group_chat INTEGER, "
            "group_msg INTEGER, PRIMARY KEY(admin_chat, msg_id))")
+db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 try:
     db.execute("ALTER TABLE op_msgs ADD COLUMN orig_msg INTEGER")
 except sqlite3.OperationalError:
     pass
-db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY COLLATE NOCASE, phone TEXT)")
 db.execute("""CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, role TEXT, text TEXT, ts TEXT)""")
