@@ -1169,9 +1169,9 @@ async def vision_reply(u, data, question):
     return ""
 
 
-async def photo_to_operator(update, context, note):
+async def photo_to_operator(update, context, note, pmsg=None):
     u = update.effective_user
-    msg = update.message
+    msg = pmsg or update.message
     for aid in ADMIN_IDS:
         try:
             cap = (f"🖼 Rasm — {u.full_name} (@{u.username or '-'}, {u.id})\n{note}\n\n"
@@ -1189,10 +1189,32 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if track(u) and u.id not in ADMIN_IDS:
         total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         await notify_admins(context, f"🆕 Yangi foydalanuvchi #{total}\n{who(u.id, u.username, u.full_name)}")
-    question = (msg.caption or "").strip()
+    await process_photo(update, context, msg, (msg.caption or "").strip())
+
+
+# Rasmdan keyin alohida yozilgan «bormi?» uchun: oxirgi rasmni eslab qolamiz
+LAST_PHOTO = {}   # (chat_id, user_id) -> (vaqt, rasm xabari)
+
+
+def remember_photo(update):
+    LAST_PHOTO[(update.effective_chat.id, update.effective_user.id)] = (_time.time(), update.message)
+
+
+def recent_photo(update, seconds=180):
+    """Matn rasmga Reply bo'lsa — o'sha rasm; aks holda shu odamning oxirgi 3 daqiqadagi rasmi."""
+    rt = update.message.reply_to_message
+    if rt is not None and (getattr(rt, "photo", None) or getattr(rt, "document", None)):
+        return rt
+    t, m = LAST_PHOTO.get((update.effective_chat.id, update.effective_user.id), (0, None))
+    return m if m is not None and _time.time() - t <= seconds else None
+
+
+async def process_photo(update, context, pmsg, question):
+    u, msg = update.effective_user, update.message
+    LAST_PHOTO.pop((update.effective_chat.id, u.id), None)
     save_msg(u.id, "user", "[rasm] " + question)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    f = msg.photo[-1] if msg.photo else msg.document
+    f = pmsg.photo[-1] if pmsg.photo else pmsg.document
     data = bytes(await (await f.get_file()).download_as_bytearray())
 
     best = None
@@ -1239,7 +1261,7 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(u.id, "ai", answer)
     await msg.reply_text(answer, disable_web_page_preview=True)  # boshqa mahsulot rasmi chiqib qolmasin
     await photo_to_operator(update, context, (f"Savol: {question}\n" if question else "") +
-                            "Kanalda aynan shu rasm topilmadi — omborda bor-yo'qligini tekshiring.")
+                            "Kanalda aynan shu rasm topilmadi — omborda bor-yo'qligini tekshiring.", pmsg)
 
 
 async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1331,6 +1353,11 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # adminning guruhdagi o'z yozishmalariga aralashmaymiz
     if not text or not group_should_answer(text, mentioned, replied):
         return
+    pm = recent_photo(update)
+    if pm is not None and (ASK_RE.search(text) or mentioned or replied):
+        track(u)
+        await process_photo(update, context, pm, text)
+        return
     track(u)
     save_msg(u.id, "user", text)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -1353,7 +1380,8 @@ async def group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if u.id in ADMIN_IDS and not mentioned:
         return
     if not (mentioned or replied or ASK_RE.search(text) or PRODUCT_RE.search(text)):
-        return  # izohsiz rasmlarga guruhda javob bermaymiz
+        remember_photo(update)  # izohsiz rasm: keyingi «bormi?» xabarini kutamiz
+        return
     await photo_msg(update, context)
 
 
