@@ -231,6 +231,7 @@ db.execute("""CREATE TABLE IF NOT EXISTS users(
     first_seen TEXT, last_seen TEXT, starts INTEGER DEFAULT 0)""")
 db.execute("CREATE TABLE IF NOT EXISTS seen_calls(id TEXT PRIMARY KEY)")
 db.execute("CREATE TABLE IF NOT EXISTS chats(user_id INTEGER PRIMARY KEY, chat_id TEXT)")
+db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS faq(id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, answer TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY COLLATE NOCASE, phone TEXT)")
@@ -520,6 +521,60 @@ def vapi_system_prompt():
     return base or "Sen Sabah AI — Sabah ko'rpa-to'shak brendining savdo yordamchisisan."
 
 
+SABAH_PERSONA = (
+    "Sen «Sabah AI» — Sabah brendining (ko'rpa-to'shak, choyshab, satin/super satin to'plamlar) rasmiy savdo yordamchisisan.\n"
+    "QOIDALAR:\n"
+    "1. Faqat Sabah mahsulotlarini taklif qil va maqta. Mijozni Sabah'dan xarid qilishga undab tur.\n"
+    "2. HECH QACHON boshqa do'kon, bozor, marketplace (OLX, Wildberries, Uzum, Ozon va h.k.) yoki raqobatchi brendni tavsiya qilma.\n"
+    "3. «Qayerdan olsam bo'ladi?», «buyurtma», «narx», «manzil» kabi savollarda Sabah kanallari va aloqa ma'lumotlarini ber.\n"
+    "4. Bilmagan narsangni (narx, mavjudlik, o'lcham) o'ylab topma — «aniqlab, operatorimiz siz bilan bog'lanadi» de "
+    "va mijozdan ism va telefon raqamini so'ra.\n"
+    "5. Suhbatni har doim xaridga yo'naltir: o'lcham (1.5 kishilik, 2 kishilik, evro), rang, kim uchun ekanini so'ra."
+)
+
+
+def get_setting(key, default=""):
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def chat_system(u):
+    parts = [SABAH_PERSONA]
+    info = get_setting("info")
+    if info:
+        parts.append("SABAH HAQIDA MA'LUMOT (kanallar, aloqa, mahsulotlar — shularga tayan):\n" + info)
+    faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
+    if faq:
+        parts.append("Tayyor ma'lumotlar:\n" + faq)
+    vp = vapi_system_prompt()
+    if "sabah" in vp.lower():  # Vapi'dagi prompt Sabah haqida bo'lsa, uni ham qo'shamiz
+        parts.append(vp)
+    if u and u.first_name:
+        parts.append(f"Mijozning ismi: {u.first_name}.")
+    text = "\n\n".join(parts)
+    text = re.sub(r"\{\{\s*name\s*\}\}", (u.first_name if u else "") or "", text)
+    text = re.sub(r"\{\{\s*maqsad\s*\}\}", "", text)
+    return text + CHAT_RULES
+
+
+async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/info matn — AI biladigan Sabah ma'lumotlari (kanallar, aloqa, mahsulotlar, narxlar)."""
+    if not is_admin(update):
+        return
+    arg = update.message.text.partition(" ")[2].strip()
+    if not arg:
+        cur = get_setting("info") or "(hali yozilmagan)"
+        await update.message.reply_text(
+            f"📝 AI biladigan Sabah ma'lumotlari:\n\n{cur}\n\n"
+            "O'zgartirish uchun /info dan keyin hammasini qaytadan yozing, masalan:\n\n"
+            "/info Telegram kanal: https://t.me/sabah_kanal\nInstagram: https://instagram.com/sabah\n"
+            "Telefon: +998 90 123 45 67\nManzil: Toshkent, ...\nSuper satin 2 kishilik — 450 000 so'm\nYetkazib berish: ...")
+        return
+    db.execute("INSERT OR REPLACE INTO settings VALUES('info', ?)", (arg,))
+    db.commit()
+    await update.message.reply_text("✅ Saqlandi. Endi AI shu ma'lumotlarga tayanib javob beradi.")
+
+
 def claude_history(uid, limit=20):
     rows = db.execute("SELECT role, text FROM messages WHERE user_id=? AND id > COALESCE("
                       "(SELECT MAX(id) FROM messages WHERE user_id=? AND role='reset'), 0) "
@@ -537,9 +592,7 @@ def claude_history(uid, limit=20):
 
 
 async def claude_reply(u):
-    system = vapi_system_prompt()
-    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
-    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
+    system = chat_system(u)
     resp = await claude.beta.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=4000,
@@ -584,12 +637,7 @@ def faq_match(text):
 
 
 async def gemini_reply(u):
-    system = vapi_system_prompt()
-    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
-    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
-    faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
-    if faq:
-        system += "\n\nSabah haqida aniq ma'lumotlar (shularga tayan):\n" + faq
+    system = chat_system(u)
     contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
                 for m in claude_history(u.id)] or [{"role": "user", "parts": [{"text": "Salom"}]}]
     async with httpx.AsyncClient(timeout=60) as client:
@@ -607,12 +655,7 @@ async def gemini_reply(u):
 
 
 async def openai_reply(u):
-    system = vapi_system_prompt()
-    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
-    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
-    faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
-    if faq:
-        system += "\n\nSabah haqida aniq ma'lumotlar (shularga tayan):\n" + faq
+    system = chat_system(u)
     msgs = [{"role": "system", "content": system}] + (claude_history(u.id) or [{"role": "user", "content": "Salom"}])
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post("https://api.openai.com/v1/chat/completions",
@@ -814,6 +857,7 @@ def home_text():
             f"🤖 Assistant: {html.escape(ASSISTANT.get('name') or ASSISTANT_ID)}\n\n"
             "Buyruqlar:\n/users — foydalanuvchilar\n/calls — ovozli suhbatlar\n/msgs — yozma xabarlar\n/stats — statistika\n"
             "/assistant — assistantni tanlash\n"
+            "/info — AI uchun Sabah ma'lumotlari (kanallar, aloqa, narxlar)\n"
             "/faq — tayyor javoblar (narx, manzil…)\n"
             "/kalit AIza… — bepul Gemini AI ni ulash\n"
             "/log — botdagi xatolarni ko'rish\n"
@@ -1087,6 +1131,7 @@ def main():
     app.add_handler(CommandHandler("msgs", msgs_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("faq", faq_cmd))
+    app.add_handler(CommandHandler("info", info_cmd))
     app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler(["kalit", "key"], key_cmd))
     app.add_handler(CommandHandler("call", call_cmd))
