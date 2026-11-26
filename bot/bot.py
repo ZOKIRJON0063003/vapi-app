@@ -829,6 +829,10 @@ MAX_PAGES = int(env.get("INDEX_PAGES") or 60)        # har kanal uchun ~20 post/
 MATCH_DIST = int(env.get("MATCH_DISTANCE") or 9)      # 0..64; kichik = qattiqroq
 db.execute("""CREATE TABLE IF NOT EXISTS images(
     url TEXT PRIMARY KEY, post TEXT, caption TEXT, h1 TEXT, h2 TEXT, ts REAL)""")
+try:
+    db.execute("ALTER TABLE images ADD COLUMN hist TEXT")  # rang gistogrammasi (o'xshash ranglarni topish uchun)
+except sqlite3.OperationalError:
+    pass
 db.commit()
 try:
     from PIL import Image, ImageOps, ImageChops
@@ -876,6 +880,41 @@ def image_hashes(data):
     h1 = ",".join(f"{_dhash(v):016x}" for v in (img, _center(img, 0.85), _center(img, 0.7)))
     h2 = f"{_dhash(ImageOps.mirror(img)):016x}"
     return h1, h2
+
+
+def color_hist(data):
+    """Rasm markazidagi (choyshab qismi) ranglar taqsimoti: 4x4x4 = 64 ta ulush."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    img = _center(_trim(img), 0.7).resize((48, 48))
+    bins = [0] * 64
+    for r, g, b in img.getdata():
+        bins[(r // 64) * 16 + (g // 64) * 4 + (b // 64)] += 1
+    n = float(sum(bins)) or 1.0
+    return [v / n for v in bins]
+
+
+def hist_str(h):
+    return ",".join(f"{v:.3f}" for v in h)
+
+
+def top_by_color(data, rows, k=8):
+    """Rangi eng o'xshash k ta kanal rasmi: [(o'xshashlik, post, url, matn)]."""
+    q = color_hist(data)
+    scored = []
+    for url, post, cap, hs in rows:
+        if not hs:
+            continue
+        h = [float(x) for x in hs.split(",")]
+        scored.append((sum(min(a, b) for a, b in zip(q, h)), post, url, cap or ""))
+    scored.sort(reverse=True)
+    out, seen = [], set()
+    for sc in scored:  # bitta postdan bitta rasm
+        if sc[1] not in seen:
+            out.append(sc)
+            seen.add(sc[1])
+        if len(out) >= k:
+            break
+    return out
 
 
 def _ham(a, b):
@@ -937,15 +976,18 @@ async def build_index(force=False):
                     new_here = 0
                     for post, imgs, txt in posts:
                         for iu in imgs:
-                            if not force and db.execute("SELECT 1 FROM images WHERE url=?", (iu,)).fetchone():
+                            row = db.execute("SELECT hist FROM images WHERE url=?", (iu,)).fetchone()
+                            if not force and row and row[0]:
                                 continue
                             try:
                                 ir = await client.get(iu)
                                 h1, h2 = await asyncio.to_thread(image_hashes, ir.content)
+                                hh = hist_str(await asyncio.to_thread(color_hist, ir.content))
                             except Exception:
                                 continue
-                            db.execute("INSERT OR REPLACE INTO images VALUES(?,?,?,?,?,?)",
-                                       (iu, f"https://t.me/{post}", txt[:500], h1, h2, _time.time()))
+                            db.execute("INSERT OR REPLACE INTO images(url, post, caption, h1, h2, ts, hist) "
+                                       "VALUES(?,?,?,?,?,?,?)",
+                                       (iu, f"https://t.me/{post}", txt[:500], h1, h2, _time.time(), hh))
                             added += 1
                             new_here += 1
                     db.commit()
@@ -971,13 +1013,72 @@ async def index_loop(app):
         await asyncio.sleep(6 * 3600)  # har 6 soatda yangi postlarni qo'shadi
 
 
+def _small_jpeg(data, side=384):
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    img.thumbnail((side, side))
+    b = io.BytesIO()
+    img.save(b, "JPEG", quality=80)
+    return base64.b64encode(b.getvalue()).decode()
+
+
+async def ai_pick(data, cands):
+    """AI mijoz rasmini (0-rasm) nomzodlar (1..N) bilan solishtiradi. Mos nomzod raqami yoki 0."""
+    if not (OPENAI_KEY or GEMINI_KEY) or not cands:
+        return 0
+    imgs = [_small_jpeg(data)]
+    async with httpx.AsyncClient(timeout=30, headers=UA, follow_redirects=True) as client:
+        for _, _, url, _ in cands:
+            try:
+                imgs.append(_small_jpeg((await client.get(url)).content))
+            except Exception:
+                imgs.append(None)
+    ask = (f"0-rasm — mijoz yuborgan rasm. 1..{len(cands)} — do'kondagi mahsulot rasmlari. "
+           "Qaysi raqamdagi rasmda AYNAN O'SHA mato naqshi (bir xil rasm/print dizayni: bir xil figuralar, "
+           "bir xil joylashuv) bor? Faqat rang yoki uslubi o'xshash bo'lsa — bu mos EMAS. "
+           'Faqat JSON qaytar: {"match": raqam yoki 0}')
+    try:
+        if OPENAI_KEY:
+            content = [{"type": "text", "text": ask}]
+            for i, b in enumerate(imgs):
+                if b:
+                    content += [{"type": "text", "text": f"{i}-rasm:"},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}", "detail": "low"}}]
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post("https://api.openai.com/v1/chat/completions",
+                                      headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                                      json={"model": OPENAI_MODEL, "max_tokens": 50,
+                                            "response_format": {"type": "json_object"},
+                                            "messages": [{"role": "user", "content": content}]})
+            txt = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", "") if r.status_code == 200 else ""
+        else:
+            parts = [{"text": ask}]
+            for i, b in enumerate(imgs):
+                if b:
+                    parts += [{"text": f"{i}-rasm:"}, {"inline_data": {"mime_type": "image/jpeg", "data": b}}]
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_KEY},
+                    json={"contents": [{"role": "user", "parts": parts}],
+                          "generationConfig": {"responseMimeType": "application/json"}})
+            c = (r.json().get("candidates") or [{}])[0] if r.status_code == 200 else {}
+            txt = "".join(p.get("text", "") for p in ((c.get("content") or {}).get("parts") or []))
+        m = re.search(r'"match"\s*:\s*(\d+)', txt or "")
+        n = int(m.group(1)) if m else 0
+        return n if 1 <= n <= len(cands) and imgs[n] else 0
+    except Exception as e:
+        log.warning("AI solishtirish xatosi: %s", e)
+        return 0
+
+
 async def vision_reply(u, data, question):
     """AI rasmga qarab katalogdan o'xshash bo'limni taklif qiladi."""
     b64 = base64.b64encode(data).decode()
     ask = ("Mijoz rasm yubordi" + (f" va yozdi: «{question}»" if question else "") +
-           ". Rasmdagi mato/choyshabni qisqa tasvirla (rang, naqsh, bolalar/kattalar uchun) va katalogdan eng "
-           "o'xshash bo'limni HAVOLASI bilan taklif qil. Aynan shu rasm bor deb aniq aytma — "
-           "aniq javob uchun admin tekshirishini ayt.")
+           ". Aynan shu naqsh kanallarimizda TOPILMADI. Rasmdagi matoni 1 gapda tasvirla (rang, naqsh, "
+           "bolalar/kattalar uchun) va mijozga: «aynan shu naqsh hozir kanalda ko'rinmayapti, adminimiz "
+           "omborda bor-yo'qligini tekshiradi» de. Aniq post havolasini BERMA (u boshqa mahsulot bo'lib "
+           "chiqishi mumkin) — faqat umumiy kanal havolasini ber. 2–3 gapdan oshmasin.")
     system = chat_system(u)
     if OPENAI_KEY:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -1038,6 +1139,19 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             best = await asyncio.to_thread(find_match, data, rows)
         except Exception as e:
             log.warning("Rasm solishtirish xatosi: %s", e)
+    via = "barmoq izi"
+    if not (best and best[0] <= MATCH_DIST) and (OPENAI_KEY or GEMINI_KEY):
+        # Boshqa burchakdan olingan rasm bo'lishi mumkin: rangi o'xshash nomzodlarni AI bilan solishtiramiz
+        try:
+            rows = db.execute("SELECT url, post, caption, hist FROM images").fetchall()
+            cands = await asyncio.to_thread(top_by_color, data, rows, 8)
+            n = await ai_pick(data, cands)
+            if n:
+                _, post, _, cap = cands[n - 1]
+                best, via = (0, post, cap), "AI solishtirdi"
+        except Exception as e:
+            log.warning("Rang bo'yicha qidirish xatosi: %s", e)
+
     if best and best[0] <= MATCH_DIST:
         d, post, cap = best
         cap1 = cap.split("\n")[0][:200] if cap else ""
@@ -1047,7 +1161,7 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   f"\nNarx va buyurtma uchun: {admin}\nRang/kod va miqdorini (rulon yoki metr) yozsangiz, tayyorlab qo'yamiz 😊")
         save_msg(u.id, "ai", answer)
         await msg.reply_text(answer, disable_web_page_preview=False)
-        log.info("Rasm topildi: %s (masofa %d)", post, d)
+        log.info("Rasm topildi (%s): %s", via, post)
         return
 
     answer = ""
@@ -1055,15 +1169,14 @@ async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = await vision_reply(u, data, question)
     except Exception as e:
         log.error("Rasm AI xatosi: %s", e)
-    if answer:
-        answer += "\n\n🔎 Aniq shu rasmni adminimiz tekshirib, tez orada javob beradi."
-        save_msg(u.id, "ai", answer)
-        await msg.reply_text(answer)
-    else:
-        await msg.reply_text("🔎 Rasmni oldik! Adminimiz tekshirib, bor-yo'qligini tez orada aytadi 🙏\n"
-                             "Katalog: https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj")
-    near = f"Eng yaqin kanal rasmi: {best[1]} (o'xshashlik masofasi {best[0]})" if best else "Kanal indeksida mos rasm topilmadi"
-    await photo_to_operator(update, context, (f"Savol: {question}\n" if question else "") + near)
+    if not answer:
+        answer = ("🔎 Aynan shu naqsh hozir kanalimizda ko'rinmayapti. Adminimiz omborda bor-yo'qligini "
+                  "tekshirib, tez orada javob beradi 🙏")
+    answer += "\n\n📚 Barcha matolar: https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj"
+    save_msg(u.id, "ai", answer)
+    await msg.reply_text(answer, disable_web_page_preview=True)  # boshqa mahsulot rasmi chiqib qolmasin
+    await photo_to_operator(update, context, (f"Savol: {question}\n" if question else "") +
+                            "Kanalda aynan shu rasm topilmadi — omborda bor-yo'qligini tekshiring.")
 
 
 async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
