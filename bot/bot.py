@@ -560,6 +560,20 @@ def norm(t):
     return re.sub(r"['`ʻ’‘]", "", (t or "").lower())
 
 
+GREET_RE = re.compile(r"^\W*(salom|assalom\w*|asalom\w*|salomaleykum|hayrli \w+|привет|здравствуйте|hello|hi)\W*$", re.I)
+THANKS_RE = re.compile(r"^\W*(rahmat|raxmat|tashakkur|спасибо|thanks?|thank you)\W*\w*\W*$", re.I)
+
+
+def builtin_answer(text, u):
+    """AI'siz ham ishlaydigan oddiy javoblar."""
+    if GREET_RE.match(text):
+        return (f"Va alaykum assalom, {u.first_name or 'hurmatli mijoz'}! 😊 Men Sabah AI.\n"
+                "Savolingizni yozing yoki 🎙 tugmasini bosib men bilan ovozli gaplashing.")
+    if THANKS_RE.match(text):
+        return "Arzimaydi! 😊 Yana savol bo'lsa, bemalol yozing."
+    return None
+
+
 def faq_match(text):
     t, best, score = norm(text), None, 0
     for kw, ans in db.execute("SELECT keywords, answer FROM faq"):
@@ -746,7 +760,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_msg(u.id, "user", text)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     # 1) Tayyor javob (FAQ) — bepul va aniq
-    answer = faq_match(text)
+    answer = faq_match(text) or builtin_answer(text, u)
     # 2) Gemini (bepul AI)
     if not answer and GEMINI_KEY:
         try:
