@@ -768,9 +768,19 @@ async def admin_reply(update, context):
     if not row:
         return False
     try:
-        # Mijozning o'z savoli/rasmiga reply qilib yuboramiz — nima haqida ekani ko'rinib tursin
-        await context.bot.send_message(row[0], f"👩‍💼 Sabah operatori:\n{update.message.text}",
-                                       reply_to_message_id=row[1], allow_sending_without_reply=True)
+        reply = f"👩‍💼 Sabah operatori:\n{update.message.text}"
+        if row[1]:
+            # Mijozning o'z savoli/rasmiga reply qilib yuboramiz — nima haqida ekani ko'rinib tursin
+            await context.bot.send_message(row[0], reply, reply_to_message_id=row[1],
+                                           allow_sending_without_reply=True)
+        elif rt.photo or rt.document:
+            # Eski savol (asl xabar ma'lum emas): mijozning rasmini javob bilan birga qaytaramiz
+            await context.bot.copy_message(row[0], update.effective_chat.id, rt.message_id,
+                                           caption=f"🖼 Siz so'ragan rasm\n\n{reply}"[:1000])
+        else:
+            q = re.sub(r"<[^>]+>", "", (rt.text or "")).split("\n\n")
+            asked = q[1].strip() if len(q) > 1 else ""
+            await context.bot.send_message(row[0], (f"❓ Savolingiz: «{asked[:300]}»\n\n" if asked else "") + reply)
         save_msg(row[0], "ai", update.message.text)
         await update.message.reply_text("✅ Javob mijozga yuborildi.")
     except Exception as e:
