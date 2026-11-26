@@ -168,12 +168,28 @@ if numbers:
 else:
     print("ℹ️  Vapi'da telefon raqam yo'q — telefon qo'ng'iroqlari o'chiq (Telnyx/Twilio raqamini ulang).")
 
+# 8) Claude (Anthropic) — yozma xabarlarga javob berish uchun
+ANTHROPIC_KEY = (env.get("ANTHROPIC_API_KEY") or "").strip()
+CLAUDE_MODEL = (env.get("CLAUDE_MODEL") or "claude-opus-5-5").strip()
+claude = None
+if ANTHROPIC_KEY:
+    try:
+        import anthropic
+        claude = anthropic.AsyncAnthropic(api_key=ANTHROPIC_KEY)
+        print(f"✅ Claude ({CLAUDE_MODEL}) yozma savollarga javob beradi")
+    except ImportError:
+        print("⚠️  'anthropic' kutubxonasi o'rnatilmagan:  pip install anthropic")
+else:
+    print("ℹ️  ANTHROPIC_API_KEY yo'q — yozma javoblar Vapi chat orqali (karta talab qiladi).")
+
 # .env ni toza holatda qayta yozamiz
 with open(ENV_FILE, "w") as f:
     f.write(f"BOT_TOKEN={BOT_TOKEN}\nVAPI_API_KEY={VAPI_KEY}\nVAPI_PUBLIC_KEY={PUBLIC_KEY}\n"
             f"VAPI_ASSISTANT_ID={ASSISTANT_ID}\nADMIN_IDS={','.join(map(str, ADMIN_IDS))}\n"
             f"VOICE_PROVIDER={VOICE_PROVIDER}\nVOICE_FEMALE={VOICE_FEMALE}\nVOICE_MALE={VOICE_MALE}\n"
-            + (f"VAPI_PHONE_NUMBER_ID={PHONE_ID}\n" if PHONE_ID else ""))
+            + (f"VAPI_PHONE_NUMBER_ID={PHONE_ID}\n" if PHONE_ID else "")
+            + (f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}\n" if ANTHROPIC_KEY else "")
+            + (f"CLAUDE_MODEL={CLAUDE_MODEL}\n" if env.get("CLAUDE_MODEL") else ""))
 os.chmod(ENV_FILE, 0o600)
 
 # ---------------------------------------------------------------- ma'lumotlar bazasi
@@ -460,6 +476,57 @@ async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Saqlandi: {name} — {phone}\nEndi «{name}ga ter» deb yozsangiz bo'ladi.")
 
 
+# ---------------------------------------------------------------- Claude bilan yozma suhbat
+CHAT_RULES = (
+    "\n\n---\nHozir sen Telegram'da YOZMA chatdasan (ovozli emas). Mijozga o'zbek tilida, qisqa va aniq "
+    "(odatda 1–4 gap) javob ber. Markdown belgilari (**, #, jadval) ishlatma — oddiy matn va kerak bo'lsa emoji. "
+    "Ovozli suhbat kerak bo'lsa, mijozga «🎙 AI bilan gaplashish» tugmasini eslat."
+)
+
+
+def vapi_system_prompt():
+    """Vapi assistantdagi System Prompt — AI ovozda ham, yozuvda ham bir xil gapirishi uchun."""
+    model = (ASSISTANT or {}).get("model") or {}
+    parts = [m.get("content", "") for m in model.get("messages") or [] if m.get("role") == "system"]
+    base = "\n\n".join(p for p in parts if isinstance(p, str) and p.strip())
+    return base or "Sen Sabah AI — Sabah ko'rpa-to'shak brendining savdo yordamchisisan."
+
+
+def claude_history(uid, limit=20):
+    rows = db.execute("SELECT role, text FROM messages WHERE user_id=? AND id > COALESCE("
+                      "(SELECT MAX(id) FROM messages WHERE user_id=? AND role='reset'), 0) "
+                      "ORDER BY id DESC LIMIT ?", (uid, uid, limit)).fetchall()
+    msgs = []
+    for role, text in reversed(rows):
+        r = "assistant" if role == "ai" else "user"
+        if msgs and msgs[-1]["role"] == r:
+            msgs[-1]["content"] += "\n" + text  # ketma-ket bir xil rol — birlashtiramiz
+        else:
+            msgs.append({"role": r, "content": text})
+    while msgs and msgs[0]["role"] != "user":
+        msgs.pop(0)
+    return msgs
+
+
+async def claude_reply(u):
+    system = vapi_system_prompt()
+    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
+    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
+    resp = await claude.beta.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4000,
+        system=system,
+        messages=claude_history(u.id),
+        output_config={"effort": "low"},          # chat: tez va arzon
+        cache_control={"type": "ephemeral"},      # System Prompt keshlanadi
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",                      # rad etilsa, boshqa model davom ettiradi
+    )
+    if resp.stop_reason == "refusal":
+        return "Kechirasiz, bu savolga javob bera olmayman. Sabah mahsulotlari haqida so'rang 🙂"
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     text = (update.message.text or "").strip()
@@ -478,6 +545,27 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admins(context, f"🆕 Yangi foydalanuvchi #{total}\n{who(u.id, u.username, u.full_name)}")
     save_msg(u.id, "user", text)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    if claude:
+        sorry = "Kechirasiz, hozir javob bera olmayapman. Birozdan keyin yozing 🙏"
+        try:
+            answer = await claude_reply(u) or "Kechirasiz, tushunmadim. Boshqacha yozib ko'ring."
+        except anthropic.AuthenticationError:
+            log.error("Claude: ANTHROPIC_API_KEY noto'g'ri yoki o'chirilgan")
+            answer = sorry
+        except anthropic.RateLimitError:
+            log.error("Claude: limit oshdi, keyinroq urinib ko'ring")
+            answer = "Hozir juda ko'p so'rov bor, bir daqiqadan keyin yozing 🙏"
+        except anthropic.APIStatusError as e:
+            log.error("Claude xatosi %s: %s", e.status_code, str(e.message)[:400])
+            answer = sorry
+        except anthropic.APIConnectionError as e:
+            log.error("Claude bilan aloqa xatosi: %s", e)
+            answer = sorry
+        else:
+            save_msg(u.id, "ai", answer)
+        for i in range(0, len(answer), 4000):
+            await update.message.reply_text(answer[i:i + 4000])
+        return
     row = db.execute("SELECT chat_id FROM chats WHERE user_id=?", (u.id,)).fetchone()
     body = {"assistantId": ASSISTANT_ID, "input": text,
             "assistantOverrides": {"variableValues": {"name": u.first_name or ""},
@@ -510,6 +598,7 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.execute("DELETE FROM chats WHERE user_id=?", (update.effective_user.id,))
+    save_msg(update.effective_user.id, "reset", "")
     db.commit()
     await update.message.reply_text("🔄 Suhbat yangidan boshlandi. Savolingizni yozing.")
 
@@ -564,7 +653,7 @@ def users_text(page=0, per=20):
 
 def msgs_text(limit=30):
     rows = db.execute("SELECT m.user_id, m.role, m.text, m.ts, u.username, u.name FROM messages m "
-                      "LEFT JOIN users u ON u.id = m.user_id ORDER BY m.id DESC LIMIT ?", (limit,)).fetchall()
+                      "LEFT JOIN users u ON u.id = m.user_id WHERE m.role != 'reset' ORDER BY m.id DESC LIMIT ?", (limit,)).fetchall()
     if not rows:
         return "💬 Hali yozma xabarlar yo'q.", InlineKeyboardMarkup([BACK_KB])
     lines = ["💬 <b>Oxirgi yozma xabarlar</b>\n"]
