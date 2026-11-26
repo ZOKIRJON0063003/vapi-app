@@ -817,6 +817,269 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                              "Gemini kalitini bepul olish: aistudio.google.com → Get API key")
 
 
+# ---------------------------------------------------------------- RASM orqali qidirish
+# Kanallardagi rasmlar t.me/s/<kanal> sahifasidan yig'iladi va "dHash" barmoq izi bilan saqlanadi.
+# Mijoz rasm yuborsa, shu barmoq izlari bilan solishtiriladi.
+import base64
+import io
+import time as _time
+
+CHANNELS = [c.strip() for c in (env.get("CHANNELS") or "Sabaevhomeuz,Pastel9006,SUPER7677").split(",") if c.strip()]
+MAX_PAGES = int(env.get("INDEX_PAGES") or 60)        # har kanal uchun ~20 post/sahifa
+MATCH_DIST = int(env.get("MATCH_DISTANCE") or 9)      # 0..64; kichik = qattiqroq
+db.execute("""CREATE TABLE IF NOT EXISTS images(
+    url TEXT PRIMARY KEY, post TEXT, caption TEXT, h1 TEXT, h2 TEXT, ts REAL)""")
+db.commit()
+try:
+    from PIL import Image, ImageOps, ImageChops
+except ImportError:
+    Image = None
+    print("⚠️  Rasm qidirish uchun Pillow kerak:  pip install pillow")
+
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15"}
+INDEX_STATE = {"running": False, "done": 0, "last": 0.0}
+
+
+def _dhash(img, size=8):
+    g = img.convert("L").resize((size + 1, size), Image.LANCZOS)
+    px = list(g.getdata())
+    bits = 0
+    for r in range(size):
+        for c in range(size):
+            bits = (bits << 1) | (px[r * (size + 1) + c] > px[r * (size + 1) + c + 1])
+    return bits
+
+
+def _trim(img):
+    """Skrinshot chetlaridagi bir xil rangli hoshiyani olib tashlaydi."""
+    rgb = img.convert("RGB")
+    bg = Image.new("RGB", rgb.size, rgb.getpixel((0, 0)))
+    box = ImageChops.difference(rgb, bg).convert("L").point(lambda v: 255 if v > 25 else 0).getbbox()
+    return rgb.crop(box) if box and (box[2] - box[0]) > 50 and (box[3] - box[1]) > 50 else rgb
+
+
+def _variants(img):
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    t = _trim(img)
+    return [img, t, _center(t, 0.85), _center(t, 0.7)]  # skrinshot va kadrlash uchun
+
+
+def _center(img, f):
+    w, h = img.size
+    dw, dh = int(w * (1 - f) / 2), int(h * (1 - f) / 2)
+    return img.crop((dw, dh, w - dw, h - dh))
+
+
+def image_hashes(data):
+    """Kanal rasmi uchun barmoq izlari: to'liq, markazdan kesilgan (85%, 70%) va oynadagi aksi."""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    h1 = ",".join(f"{_dhash(v):016x}" for v in (img, _center(img, 0.85), _center(img, 0.7)))
+    h2 = f"{_dhash(ImageOps.mirror(img)):016x}"
+    return h1, h2
+
+
+def _ham(a, b):
+    return bin(a ^ b).count("1")
+
+
+def find_match(data, rows):
+    """Eng yaqin kanal rasmini topadi: (masofa, post havolasi, matn) yoki None."""
+    if not rows:
+        return None
+    img = Image.open(io.BytesIO(data))
+    qs = [_dhash(v) for v in _variants(img)]
+    best = None
+    for post, cap, h1, h2 in rows:
+        hs = [int(x, 16) for x in (h1 + "," + h2).split(",") if x]
+        d = min(_ham(q, h) for q in qs for h in hs)
+        if best is None or d < best[0]:
+            best = (d, post, cap or "")
+    return best
+
+
+POST_RE = re.compile(r'data-post="([^"]+)"(.*?)(?=data-post="|\Z)', re.S)
+IMG_RE = re.compile(r"tgme_widget_message_photo_wrap[^>]*?background-image:url\('([^']+)'\)", re.S)
+TXT_RE = re.compile(r'tgme_widget_message_text[^>]*>(.*?)</div>', re.S)
+
+
+def parse_channel_page(html_text):
+    """t.me/s/<kanal> sahifasidan [(post, [rasm url], matn)] ro'yxati."""
+    out = []
+    for post, body in POST_RE.findall(html_text):
+        imgs = IMG_RE.findall(body)
+        m = TXT_RE.search(body)
+        txt = re.sub(r"<br\s*/?>", "\n", m.group(1)) if m else ""
+        txt = html.unescape(re.sub(r"<[^>]+>", "", txt)).strip()
+        if imgs:
+            out.append((post, imgs, txt))
+    return out
+
+
+async def build_index(force=False):
+    if Image is None or INDEX_STATE["running"]:
+        return
+    INDEX_STATE["running"] = True
+    added = 0
+    try:
+        async with httpx.AsyncClient(timeout=30, headers=UA, follow_redirects=True) as client:
+            for ch in CHANNELS:
+                before = None
+                for _ in range(MAX_PAGES):
+                    url = f"https://t.me/s/{ch}" + (f"?before={before}" if before else "")
+                    try:
+                        r = await client.get(url)
+                    except httpx.HTTPError as e:
+                        log.warning("Kanal sahifasi o'qilmadi %s: %s", url, e)
+                        break
+                    posts = parse_channel_page(r.text)
+                    if not posts:
+                        break
+                    new_here = 0
+                    for post, imgs, txt in posts:
+                        for iu in imgs:
+                            if not force and db.execute("SELECT 1 FROM images WHERE url=?", (iu,)).fetchone():
+                                continue
+                            try:
+                                ir = await client.get(iu)
+                                h1, h2 = await asyncio.to_thread(image_hashes, ir.content)
+                            except Exception:
+                                continue
+                            db.execute("INSERT OR REPLACE INTO images VALUES(?,?,?,?,?,?)",
+                                       (iu, f"https://t.me/{post}", txt[:500], h1, h2, _time.time()))
+                            added += 1
+                            new_here += 1
+                    db.commit()
+                    INDEX_STATE["done"] = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+                    ids = [int(p.split("/")[-1]) for p, _, _ in posts if p.split("/")[-1].isdigit()]
+                    if not ids or (new_here == 0 and not force and before is not None):
+                        break  # eski postlar allaqachon indeksda
+                    before = min(ids)
+                    await asyncio.sleep(0.5)
+    finally:
+        INDEX_STATE["running"] = False
+        INDEX_STATE["last"] = _time.time()
+        total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        log.info("Rasm indeksi yangilandi: +%d, jami %d ta rasm", added, total)
+
+
+async def index_loop(app):
+    while True:
+        try:
+            await build_index()
+        except Exception as e:
+            log.warning("Rasm indeksi xatosi: %s", e)
+        await asyncio.sleep(6 * 3600)  # har 6 soatda yangi postlarni qo'shadi
+
+
+async def vision_reply(u, data, question):
+    """AI rasmga qarab katalogdan o'xshash bo'limni taklif qiladi."""
+    b64 = base64.b64encode(data).decode()
+    ask = ("Mijoz rasm yubordi" + (f" va yozdi: «{question}»" if question else "") +
+           ". Rasmdagi mato/choyshabni qisqa tasvirla (rang, naqsh, bolalar/kattalar uchun) va katalogdan eng "
+           "o'xshash bo'limni HAVOLASI bilan taklif qil. Aynan shu rasm bor deb aniq aytma — "
+           "aniq javob uchun admin tekshirishini ayt.")
+    system = chat_system(u)
+    if OPENAI_KEY:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post("https://api.openai.com/v1/chat/completions",
+                                  headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                                  json={"model": OPENAI_MODEL, "max_tokens": 600, "messages": [
+                                      {"role": "system", "content": system},
+                                      {"role": "user", "content": [
+                                          {"type": "text", "text": ask},
+                                          {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]})
+        if r.status_code == 200:
+            return ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+        log.error("OpenAI rasm xatosi %s: %s", r.status_code, r.text[:300])
+    if GEMINI_KEY:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                headers={"x-goog-api-key": GEMINI_KEY},
+                json={"systemInstruction": {"parts": [{"text": system}]},
+                      "contents": [{"role": "user", "parts": [{"text": ask},
+                                                              {"inline_data": {"mime_type": "image/jpeg", "data": b64}}]}]})
+        if r.status_code == 200:
+            c = (r.json().get("candidates") or [{}])[0]
+            return "".join(p.get("text", "") for p in ((c.get("content") or {}).get("parts") or [])).strip()
+        log.error("Gemini rasm xatosi %s: %s", r.status_code, r.text[:300])
+    return ""
+
+
+async def photo_to_operator(update, context, note):
+    u = update.effective_user
+    msg = update.message
+    for aid in ADMIN_IDS:
+        try:
+            cap = (f"🖼 Rasm — {u.full_name} (@{u.username or '-'}, {u.id})\n{note}\n\n"
+                   "Javob berish uchun shu xabarga «Reply» qiling.")
+            m = await msg.copy(aid, caption=cap[:1000])
+            db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (aid, m.message_id, u.id))
+            db.commit()
+        except Exception as e:
+            log.warning("Rasm operatorga yuborilmadi: %s", e)
+
+
+async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u, msg = update.effective_user, update.message
+    if track(u) and u.id not in ADMIN_IDS:
+        total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        await notify_admins(context, f"🆕 Yangi foydalanuvchi #{total}\n{who(u.id, u.username, u.full_name)}")
+    question = (msg.caption or "").strip()
+    save_msg(u.id, "user", "[rasm] " + question)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    f = msg.photo[-1] if msg.photo else msg.document
+    data = bytes(await (await f.get_file()).download_as_bytearray())
+
+    best = None
+    if Image is not None:
+        try:
+            rows = db.execute("SELECT post, caption, h1, h2 FROM images").fetchall()
+            best = await asyncio.to_thread(find_match, data, rows)
+        except Exception as e:
+            log.warning("Rasm solishtirish xatosi: %s", e)
+    if best and best[0] <= MATCH_DIST:
+        d, post, cap = best
+        cap1 = cap.split("\n")[0][:200] if cap else ""
+        ch = post.split("/")[3] if post.count("/") >= 4 else ""
+        admin = ("@komil_1247, +998 90 021 12 47" if ch == "Pastel9006" else "@sabaev_admin, +998 90 099 09 44")
+        answer = (f"✅ Ha, bu mato bizda bor!\n👉 {post}\n" + (f"📝 {cap1}\n" if cap1 else "") +
+                  f"\nNarx va buyurtma uchun: {admin}\nRang/kod va miqdorini (rulon yoki metr) yozsangiz, tayyorlab qo'yamiz 😊")
+        save_msg(u.id, "ai", answer)
+        await msg.reply_text(answer, disable_web_page_preview=False)
+        log.info("Rasm topildi: %s (masofa %d)", post, d)
+        return
+
+    answer = ""
+    try:
+        answer = await vision_reply(u, data, question)
+    except Exception as e:
+        log.error("Rasm AI xatosi: %s", e)
+    if answer:
+        answer += "\n\n🔎 Aniq shu rasmni adminimiz tekshirib, tez orada javob beradi."
+        save_msg(u.id, "ai", answer)
+        await msg.reply_text(answer)
+    else:
+        await msg.reply_text("🔎 Rasmni oldik! Adminimiz tekshirib, bor-yo'qligini tez orada aytadi 🙏\n"
+                             "Katalog: https://claude.ai/artifact/65qGVW5DsKiduNyTDHxFbj")
+    near = f"Eng yaqin kanal rasmi: {best[1]} (o'xshashlik masofasi {best[0]})" if best else "Kanal indeksida mos rasm topilmadi"
+    await photo_to_operator(update, context, (f"Savol: {question}\n" if question else "") + near)
+
+
+async def reindex_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    n = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    if INDEX_STATE["running"]:
+        await update.message.reply_text(f"⏳ Indekslash davom etmoqda… hozircha {INDEX_STATE['done']} ta rasm.")
+        return
+    await update.message.reply_text(f"🔄 Kanallar qayta o'qilmoqda ({', '.join('@' + c for c in CHANNELS)}). "
+                                    f"Hozir indeksda {n} ta rasm. Bir necha daqiqa oladi.")
+    await build_index()
+    n2 = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    await update.message.reply_text(f"✅ Tayyor: indeksda {n2} ta rasm.")
+
+
 async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/log — botning oxirgi xatolari (terminal ochmasdan)."""
     if not is_admin(update):
@@ -911,6 +1174,7 @@ def home_text():
             "/faq — tayyor javoblar (narx, manzil…)\n"
             "/kalit AIza… — bepul Gemini AI ni ulash\n"
             "/log — botdagi xatolarni ko'rish\n"
+            "/reindex — kanal rasmlarini qayta o'qish (rasm bo'yicha qidiruv)\n"
             "/send matn — hammaga xabar ({{name}} = mijoz ismi)\n\n"
             "📞 <b>Telefon qo'ng'iroq</b>" + (f" ({html.escape(PHONE_LABEL)})" if PHONE_ID else " — <i>o'chiq, raqam ulanmagan</i>") + "\n"
             "«Aliga ter» yoki «+998901234567 ga qo'ng'iroq qil, buyurtmani tasdiqlasin»\n"
@@ -1157,6 +1421,7 @@ async def assistant_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app):
     app.bot_data["watch_task"] = asyncio.create_task(watch_calls(app))
+    app.bot_data["index_task"] = asyncio.create_task(index_loop(app))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1190,6 +1455,8 @@ def main():
     app.add_handler(CommandHandler(["kontakt", "contact"], contact_cmd))
     app.add_handler(CallbackQueryHandler(dial_cb, pattern="^(no)?dial:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, text_msg))
+    app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE, photo_msg))
+    app.add_handler(CommandHandler("reindex", reindex_cmd))
     app.add_handler(CallbackQueryHandler(talk, pattern="^talk$"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm:"))
     app.add_handler(CallbackQueryHandler(transcript_cb, pattern="^tr:"))

@@ -26,7 +26,7 @@ PY=$(command -v python3 || true)
 [ -z "$PY" ] && { echo "❌ python3 topilmadi. Avval: brew install python"; exit 1; }
 [ -x venv/bin/python ] || "$PY" -m venv venv
 venv/bin/python -m pip install -q --upgrade pip >/dev/null 2>&1 || true
-venv/bin/python -m pip install -q "python-telegram-bot>=22" httpx anthropic
+venv/bin/python -m pip install -q "python-telegram-bot>=22" httpx anthropic pillow
 echo "✅ Kutubxonalar o'rnatildi"
 
 say "2/5  Bot fayllari (eng yangi versiya)"
