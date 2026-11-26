@@ -190,6 +190,12 @@ GEMINI_MODEL = (env.get("GEMINI_MODEL") or "gemini-2.5-flash").strip()
 print("✅ Gemini (bepul) yozma savollarga javob beradi" if GEMINI_KEY else
       "ℹ️  Gemini kaliti yo'q — Telegram'da adminga: /kalit AIza...")
 
+# 10) OpenAI (ixtiyoriy) — yozma javoblar uchun
+OPENAI_KEY = (env.get("OPENAI_API_KEY") or "").strip()
+OPENAI_MODEL = (env.get("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+if OPENAI_KEY:
+    print(f"✅ OpenAI ({OPENAI_MODEL}) yozma savollarga javob beradi")
+
 # .env ni toza holatda qayta yozamiz
 with open(ENV_FILE, "w") as f:
     f.write(f"BOT_TOKEN={BOT_TOKEN}\nVAPI_API_KEY={VAPI_KEY}\nVAPI_PUBLIC_KEY={PUBLIC_KEY}\n"
@@ -199,7 +205,9 @@ with open(ENV_FILE, "w") as f:
             + (f"ANTHROPIC_API_KEY={ANTHROPIC_KEY}\n" if ANTHROPIC_KEY else "")
             + (f"CLAUDE_MODEL={CLAUDE_MODEL}\n" if env.get("CLAUDE_MODEL") else "")
             + (f"GEMINI_API_KEY={GEMINI_KEY}\n" if GEMINI_KEY else "")
-            + (f"GEMINI_MODEL={GEMINI_MODEL}\n" if env.get("GEMINI_MODEL") else ""))
+            + (f"GEMINI_MODEL={GEMINI_MODEL}\n" if env.get("GEMINI_MODEL") else "")
+            + (f"OPENAI_API_KEY={OPENAI_KEY}\n" if OPENAI_KEY else "")
+            + (f"OPENAI_MODEL={OPENAI_MODEL}\n" if env.get("OPENAI_MODEL") else ""))
 
 
 def set_env(key, value):
@@ -584,6 +592,23 @@ async def gemini_reply(u):
     return "".join(p.get("text", "") for p in parts).strip()
 
 
+async def openai_reply(u):
+    system = vapi_system_prompt()
+    system = re.sub(r"\{\{\s*name\s*\}\}", u.first_name or "", system)
+    system = re.sub(r"\{\{\s*maqsad\s*\}\}", "", system) + CHAT_RULES
+    faq = "\n".join(f"- {a}" for (a,) in db.execute("SELECT answer FROM faq"))
+    if faq:
+        system += "\n\nSabah haqida aniq ma'lumotlar (shularga tayan):\n" + faq
+    msgs = [{"role": "system", "content": system}] + (claude_history(u.id) or [{"role": "user", "content": "Salom"}])
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post("https://api.openai.com/v1/chat/completions",
+                              headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                              json={"model": OPENAI_MODEL, "messages": msgs, "max_tokens": 800})
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI {r.status_code}: {r.text[:300]}")
+    return ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+
+
 async def to_operator(update, context, text):
     u = update.effective_user
     await update.message.reply_text("Savolingiz operatorimizga yuborildi, tez orada javob beramiz 🙏")
@@ -646,7 +671,7 @@ async def faq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/kalit AIza...  (Gemini)  yoki  /kalit sk-ant-...  (Claude) — kalit .env ga yoziladi."""
-    global GEMINI_KEY, claude, anthropic
+    global GEMINI_KEY, OPENAI_KEY, claude, anthropic
     if not is_admin(update):
         return
     k = update.message.text.partition(" ")[2].strip()
@@ -672,8 +697,16 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat, "✅ Claude kaliti saqlandi.")
         except ImportError:
             await context.bot.send_message(chat, "Avval terminalda: pip install anthropic")
+    elif k.startswith("sk-"):
+        OPENAI_KEY = k
+        set_env("OPENAI_API_KEY", k)
+        try:
+            test = await openai_reply(update.effective_user)
+            await context.bot.send_message(chat, f"✅ OpenAI ulandi va ishlayapti.\nSinov javobi: {test[:200]}")
+        except Exception as e:
+            await context.bot.send_message(chat, f"⚠️ Kalit saqlandi, lekin OpenAI xato berdi:\n{str(e)[:300]}")
     else:
-        await context.bot.send_message(chat, "Kalit tanilmadi. Gemini kaliti «AIza…», Claude kaliti «sk-ant-…» bilan boshlanadi.\n"
+        await context.bot.send_message(chat, "Kalit tanilmadi. Gemini «AIza…», OpenAI «sk-…», Claude «sk-ant-…» bilan boshlanadi.\n"
                                              "Gemini kalitini bepul olish: aistudio.google.com → Get API key")
 
 
@@ -720,7 +753,13 @@ async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = await gemini_reply(u)
         except Exception as e:
             log.error("Gemini xatosi: %s", e)
-    # 3) Claude (agar kalit bo'lsa)
+    # 3) OpenAI (agar kalit bo'lsa)
+    if not answer and OPENAI_KEY:
+        try:
+            answer = await openai_reply(u)
+        except Exception as e:
+            log.error("OpenAI xatosi: %s", str(e)[:300])
+    # 4) Claude (agar kalit bo'lsa)
     if not answer and claude:
         try:
             answer = await claude_reply(u)
