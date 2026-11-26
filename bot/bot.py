@@ -560,7 +560,7 @@ def norm(t):
     return re.sub(r"['`ʻ’‘]", "", (t or "").lower())
 
 
-GREET_RE = re.compile(r"^\W*(salom|assalom\w*|asalom\w*|salomaleykum|hayrli \w+|привет|здравствуйте|hello|hi)\W*$", re.I)
+GREET_RE = re.compile(r"^\W*(salom|assalom\w*|asalom\w*|salomaleykum|hayrli|привет|здравствуйте|hello|hi)(\s+\w+)?\W*$", re.I)
 THANKS_RE = re.compile(r"^\W*(rahmat|raxmat|tashakkur|спасибо|thanks?|thank you)\W*\w*\W*$", re.I)
 
 
