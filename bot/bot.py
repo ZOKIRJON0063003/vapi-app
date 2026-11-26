@@ -235,6 +235,10 @@ db.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT
 db.execute("CREATE TABLE IF NOT EXISTS faq(id INTEGER PRIMARY KEY AUTOINCREMENT, keywords TEXT, answer TEXT)")
 db.execute("CREATE TABLE IF NOT EXISTS op_group(admin_chat INTEGER, msg_id INTEGER, group_chat INTEGER, "
            "group_msg INTEGER, PRIMARY KEY(admin_chat, msg_id))")
+try:
+    db.execute("ALTER TABLE op_msgs ADD COLUMN orig_msg INTEGER")
+except sqlite3.OperationalError:
+    pass
 db.execute("CREATE TABLE IF NOT EXISTS op_msgs(admin_chat INTEGER, msg_id INTEGER, user_id INTEGER, PRIMARY KEY(admin_chat, msg_id))")
 db.execute("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY COLLATE NOCASE, phone TEXT)")
 db.execute("""CREATE TABLE IF NOT EXISTS messages(
@@ -721,7 +725,8 @@ async def openai_reply(u):
 def remember_origin(update, admin_chat, admin_msg):
     """Admin Reply qilganda javob qayerga borishini eslab qoladi: shaxsiy chat yoki guruh."""
     if update.effective_chat.type == "private":
-        db.execute("INSERT OR REPLACE INTO op_msgs VALUES(?,?,?)", (admin_chat, admin_msg, update.effective_user.id))
+        db.execute("INSERT OR REPLACE INTO op_msgs(admin_chat, msg_id, user_id, orig_msg) VALUES(?,?,?,?)",
+                   (admin_chat, admin_msg, update.effective_user.id, update.message.message_id))
     else:
         db.execute("INSERT OR REPLACE INTO op_group VALUES(?,?,?,?)",
                    (admin_chat, admin_msg, update.effective_chat.id, update.message.message_id))
@@ -753,19 +758,43 @@ async def admin_reply(update, context):
     if grp:
         try:
             await context.bot.send_message(grp[0], f"👩‍💼 Sabah operatori:\n{update.message.text}",
-                                           reply_to_message_id=grp[1])
+                                           reply_to_message_id=grp[1], allow_sending_without_reply=True)
             await update.message.reply_text("✅ Javob guruhga yuborildi.")
         except Exception as e:
             await update.message.reply_text(f"Yuborilmadi: {e}")
         return True
-    row = db.execute("SELECT user_id FROM op_msgs WHERE admin_chat=? AND msg_id=?",
+    row = db.execute("SELECT user_id, orig_msg FROM op_msgs WHERE admin_chat=? AND msg_id=?",
                      (update.effective_chat.id, rt.message_id)).fetchone()
     if not row:
         return False
     try:
-        await context.bot.send_message(row[0], f"👩‍💼 Sabah operatori:\n{update.message.text}")
+        # Mijozning o'z savoli/rasmiga reply qilib yuboramiz — nima haqida ekani ko'rinib tursin
+        await context.bot.send_message(row[0], f"👩‍💼 Sabah operatori:\n{update.message.text}",
+                                       reply_to_message_id=row[1], allow_sending_without_reply=True)
         save_msg(row[0], "ai", update.message.text)
         await update.message.reply_text("✅ Javob mijozga yuborildi.")
+    except Exception as e:
+        await update.message.reply_text(f"Yuborilmadi: {e}")
+    return True
+
+
+async def admin_relay_media(update, context):
+    """Admin savolga rasm/post bilan Reply qilsa — shu rasm mijozga (yoki guruhga) boradi."""
+    rt = update.message.reply_to_message
+    if not rt or update.effective_user.id not in ADMIN_IDS:
+        return False
+    chat = update.effective_chat.id
+    grp = db.execute("SELECT group_chat, group_msg FROM op_group WHERE admin_chat=? AND msg_id=?",
+                     (chat, rt.message_id)).fetchone()
+    row = None if grp else db.execute("SELECT user_id, orig_msg FROM op_msgs WHERE admin_chat=? AND msg_id=?",
+                                      (chat, rt.message_id)).fetchone()
+    target = grp or row
+    if not target:
+        return False
+    try:
+        await context.bot.copy_message(target[0], chat, update.message.message_id,
+                                       reply_to_message_id=target[1], allow_sending_without_reply=True)
+        await update.message.reply_text("✅ Rasm yuborildi.")
     except Exception as e:
         await update.message.reply_text(f"Yuborilmadi: {e}")
     return True
@@ -1145,6 +1174,8 @@ async def photo_to_operator(update, context, note):
 
 async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u, msg = update.effective_user, update.message
+    if update.effective_chat.type == "private" and await admin_relay_media(update, context):
+        return
     if track(u) and u.id not in ADMIN_IDS:
         total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         await notify_admins(context, f"🆕 Yangi foydalanuvchi #{total}\n{who(u.id, u.username, u.full_name)}")
