@@ -5,6 +5,8 @@ Ishga tushirish:  cd ~/vapi-bot && source venv/bin/activate && python bot.py
 """
 import os
 import re
+import functools
+print = functools.partial(print, flush=True)  # log faylga darhol yozilsin
 import sys
 import logging
 from urllib.parse import urlencode
@@ -675,6 +677,21 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                              "Gemini kalitini bepul olish: aistudio.google.com → Get API key")
 
 
+async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/log — botning oxirgi xatolari (terminal ochmasdan)."""
+    if not is_admin(update):
+        return
+    path = os.path.join(HERE, "bot.log")
+    try:
+        lines = open(path, encoding="utf-8", errors="ignore").read().splitlines()
+    except FileNotFoundError:
+        await update.message.reply_text("Log fayl yo'q (bot terminaldan ishga tushirilgan).")
+        return
+    important = [l for l in lines if "ERROR" in l or "WARNING" in l or l.startswith(("✅", "ℹ️", "⚠️", "❌", "🎉"))]
+    txt = "\n".join(important[-25:]) or "Xato yo'q ✅"
+    await update.message.reply_text("📋 Oxirgi yozuvlar:\n\n" + txt[-3800:])
+
+
 async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     text = (update.message.text or "").strip()
@@ -746,6 +763,7 @@ def home_text():
             "/assistant — assistantni tanlash\n"
             "/faq — tayyor javoblar (narx, manzil…)\n"
             "/kalit AIza… — bepul Gemini AI ni ulash\n"
+            "/log — botdagi xatolarni ko'rish\n"
             "/send matn — hammaga xabar ({{name}} = mijoz ismi)\n\n"
             "📞 <b>Telefon qo'ng'iroq</b>" + (f" ({html.escape(PHONE_LABEL)})" if PHONE_ID else " — <i>o'chiq, raqam ulanmagan</i>") + "\n"
             "«Aliga ter» yoki «+998901234567 ga qo'ng'iroq qil, buyurtmani tasdiqlasin»\n"
@@ -1016,6 +1034,7 @@ def main():
     app.add_handler(CommandHandler("msgs", msgs_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("faq", faq_cmd))
+    app.add_handler(CommandHandler("log", log_cmd))
     app.add_handler(CommandHandler(["kalit", "key"], key_cmd))
     app.add_handler(CommandHandler("call", call_cmd))
     app.add_handler(CommandHandler("assistant", assistant_cmd))
