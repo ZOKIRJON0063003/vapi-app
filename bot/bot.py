@@ -1169,12 +1169,12 @@ async def vision_reply(u, data, question):
     return ""
 
 
-async def photo_to_operator(update, context, note, pmsg=None):
+async def photo_to_operator(update, context, note, pmsg=None, kind="🖼 Rasm"):
     u = update.effective_user
     msg = pmsg or update.message
     for aid in ADMIN_IDS:
         try:
-            cap = (f"🖼 Rasm — {u.full_name} (@{u.username or '-'}, {u.id})\n{note}\n\n"
+            cap = (f"{kind} — {u.full_name} (@{u.username or '-'}, {u.id})\n{note}\n\n"
                    "Javob berish uchun shu xabarga «Reply» qiling.")
             m = await msg.copy(aid, caption=cap[:1000])
             remember_origin(update, aid, m.message_id)
@@ -1333,10 +1333,10 @@ def group_should_answer(text, mentioned, replied):
     return bool(ASK_RE.search(text) or (PRODUCT_RE.search(text) and "?" in text))
 
 
-def _group_ctx(update, context):
+def _group_ctx(update, context, override=None):
     msg = update.message
     me = (context.bot.username or "").lower()
-    txt = (msg.text or msg.caption or "")
+    txt = override if override is not None else (msg.text or msg.caption or "")
     mentioned = bool(me) and f"@{me}" in txt.lower()
     rt = msg.reply_to_message
     replied = bool(rt and rt.from_user and rt.from_user.id == context.bot.id)
@@ -1344,11 +1344,11 @@ def _group_ctx(update, context):
     return mentioned, replied, clean
 
 
-async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE, voice_text=None):
     u, msg = update.effective_user, update.message
     if not u or u.is_bot:
         return
-    mentioned, replied, text = _group_ctx(update, context)
+    mentioned, replied, text = _group_ctx(update, context, voice_text)
     if u.id in ADMIN_IDS and not mentioned:
         return  # adminning guruhdagi o'z yozishmalariga aralashmaymiz
     if not text or not group_should_answer(text, mentioned, replied):
@@ -1385,12 +1385,83 @@ async def group_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await photo_msg(update, context)
 
 
-async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------- OVOZLI XABARLAR
+TRANSCRIBE_MODEL = (env.get("TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+
+
+async def transcribe(data, mime="audio/ogg"):
+    """Ovozni matnga aylantiradi: OpenAI (gpt-4o-mini-transcribe → whisper-1), keyin Gemini."""
+    if OPENAI_KEY:
+        for model in dict.fromkeys([TRANSCRIBE_MODEL, "whisper-1"]):
+            try:
+                async with httpx.AsyncClient(timeout=90) as client:
+                    r = await client.post("https://api.openai.com/v1/audio/transcriptions",
+                                          headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                                          data={"model": model,
+                                                "prompt": "O'zbek tilida. Super satin, ranfors, pike, muleton, choyshab, rulon, metr, narxi, bormi."},
+                                          files={"file": ("voice.ogg", data, mime)})
+                if r.status_code == 200:
+                    t = (r.json().get("text") or "").strip()
+                    if t:
+                        return t
+                log.warning("OpenAI transkripsiya %s %s: %s", model, r.status_code, r.text[:200])
+            except Exception as e:
+                log.warning("OpenAI transkripsiya xatosi: %s", e)
+    if GEMINI_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_KEY},
+                    json={"contents": [{"role": "user", "parts": [
+                        {"text": "Bu ovozli xabarni aynan aytilgan tilda so'zma-so'z yozib ber. Faqat matnni qaytar."},
+                        {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}]}]})
+            if r.status_code == 200:
+                c = (r.json().get("candidates") or [{}])[0]
+                t = "".join(p.get("text", "") for p in ((c.get("content") or {}).get("parts") or [])).strip()
+                if t:
+                    return t
+            log.warning("Gemini transkripsiya %s: %s", r.status_code, r.text[:200])
+        except Exception as e:
+            log.warning("Gemini transkripsiya xatosi: %s", e)
+    return ""
+
+
+async def voice_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u, msg = update.effective_user, update.message
+    if not u or u.is_bot:
+        return
+    private = update.effective_chat.type == "private"
+    v = msg.voice or msg.audio or msg.video_note
+    if v is None:
+        return
+    if private:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    data = bytes(await (await v.get_file()).download_as_bytearray())
+    mime = getattr(v, "mime_type", None) or ("video/mp4" if msg.video_note else "audio/ogg")
+    text = await transcribe(data, mime)
+    if not text:
+        if private:
+            track(u)
+            await msg.reply_text("🎤 Ovozli xabaringizni oldik, adminimiz eshitib javob beradi 🙏\n"
+                                 "Tezroq javob uchun savolingizni yozib ham yuborishingiz mumkin.")
+            await photo_to_operator(update, context, "Matnga aylantirib bo'lmadi — eshitib javob bering.",
+                                    kind="🎤 Ovozli xabar")
+        return
+    log.info("Ovoz → matn (%s): %s", u.id, text[:120])
+    if private:
+        await msg.reply_text(f"🎤 «{text[:300]}»")
+        await text_msg(update, context, voice_text=text)
+    else:
+        await group_text(update, context, voice_text=text)
+
+
+async def text_msg(update: Update, context: ContextTypes.DEFAULT_TYPE, voice_text=None):
     u = update.effective_user
-    text = (update.message.text or "").strip()
+    text = (voice_text if voice_text is not None else (update.message.text or "")).strip()
     if not text:
         return
-    if u.id in ADMIN_IDS and await admin_reply(update, context):
+    if voice_text is None and u.id in ADMIN_IDS and await admin_reply(update, context):
         return
     if u.id in ADMIN_IDS and CALL_WORDS.search(text):
         phone, raw = find_phone(text)
@@ -1732,6 +1803,7 @@ def main():
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.PRIVATE, photo_msg))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, group_text))
     app.add_handler(MessageHandler((filters.PHOTO | filters.Document.IMAGE) & filters.ChatType.GROUPS, group_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, voice_msg))
     app.add_handler(CommandHandler("reindex", reindex_cmd))
     app.add_handler(CallbackQueryHandler(talk, pattern="^talk$"))
     app.add_handler(CallbackQueryHandler(admin_cb, pattern="^adm:"))
